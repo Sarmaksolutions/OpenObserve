@@ -113,7 +113,7 @@ jobs:
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
 
       - name: Clone the current repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - uses: ./.github/actions/github-auth
       - name: Setup Rust Toolchain
@@ -177,7 +177,7 @@ jobs:
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - id: gen
         run: |
           MATRIX=$(node .github/scripts/build-ci-matrix.js tests/ui-testing/ci-matrix/ci_matrix_regression.json)
@@ -208,7 +208,7 @@ jobs:
           sudo flock --wait 30 /var/lib/dpkg/lock-frontend true 2>/dev/null || true
 
       - name: Clone the current repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Download binary artifact
         uses: actions/download-artifact@v5
@@ -364,7 +364,7 @@ jobs:
 
     steps:
       - name: Clone the current repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -499,7 +499,7 @@ jobs:
       actions: read  # reads run/job timings from the Actions API
     steps:
       - name: Clone the current repo
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Report run metrics to OpenObserve
         continue-on-error: true
