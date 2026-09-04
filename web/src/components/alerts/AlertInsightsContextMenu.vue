@@ -1,0 +1,158 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <div
+    class="context-menu bg-surface-overlay border-border-default rounded-default fixed z-9999 min-w-50 overflow-hidden border py-1 shadow-md"
+    :style="{ top: `${y}px`, left: `${x}px` }"
+    @click.stop
+    data-test="alert-insights-context-menu"
+  >
+    <div class="menu-header bg-surface-subtle text-text-secondary px-4 py-2 text-xs font-semibold">
+      {{ isAlertNameContext ? value : panelTitle }}
+    </div>
+    <OSeparator />
+
+    <!-- Alert-specific actions (shown for Dedup and similar panels) -->
+    <template v-if="isAlertNameContext">
+      <div class="menu-section px-0 py-1">
+        <div
+          class="menu-item hover:bg-dropdown-item-hover-bg active:bg-dropdown-item-active-bg flex cursor-pointer items-center px-4 py-2 text-sm [transition:background-color_0.2s]"
+          @click="configureDedupForAlert"
+          data-test="context-menu-configure-dedup"
+        >
+          <OIcon name="tune" size="sm" class="me-2" />
+          <span>{{ t("alerts.insights.actions.configureDedup") }}</span>
+        </div>
+        <div
+          class="menu-item hover:bg-dropdown-item-hover-bg active:bg-dropdown-item-active-bg flex cursor-pointer items-center px-4 py-2 text-sm [transition:background-color_0.2s]"
+          @click="editAlert"
+          data-test="context-menu-edit-alert"
+        >
+          <OIcon name="edit" size="sm" class="me-2" />
+          <span>{{ t("alerts.insights.actions.editAlert") }}</span>
+        </div>
+        <div
+          class="menu-item hover:bg-dropdown-item-hover-bg active:bg-dropdown-item-active-bg flex cursor-pointer items-center px-4 py-2 text-sm [transition:background-color_0.2s]"
+          @click="viewAlertHistory"
+          data-test="context-menu-view-history"
+        >
+          <OIcon name="history" size="sm" class="me-2" />
+          <span>{{ t("alerts.insights.actions.viewAlertHistory") }}</span>
+        </div>
+      </div>
+      <OSeparator />
+      <div class="menu-section px-0 py-1">
+        <div
+          class="menu-item hover:bg-dropdown-item-hover-bg active:bg-dropdown-item-active-bg flex cursor-pointer items-center px-4 py-2 text-sm [transition:background-color_0.2s]"
+          @click="$emit('close')"
+          data-test="context-menu-cancel"
+        >
+          <OIcon name="close" size="sm" class="me-2" />
+          <span>{{ t("common.cancel") }}</span>
+        </div>
+      </div>
+    </template>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, onMounted, onUnmounted } from "vue";
+import { useI18nTyped } from "@/types/i18n";
+import OIcon from "@/lib/core/Icon/OIcon.vue";
+import OSeparator from "@/lib/core/Separator/OSeparator.vue";
+
+const { t } = useI18nTyped();
+
+const props = defineProps<{
+  x: number;
+  y: number;
+  value: number | string;
+  panelTitle: string;
+  panelId: string;
+}>();
+
+const emit = defineEmits<{
+  close: [];
+  filter: [
+    {
+      operator: string;
+      value: number;
+      panelId: string;
+      panelTitle: string;
+    },
+  ];
+  "select-alert": [string];
+  "configure-dedup": [string];
+  "edit-alert": [string];
+  "view-history": [string];
+}>();
+
+const isAlertNameContext = computed(() => {
+  // Check if we're clicking on a panel that shows alert names
+  const alertNamePanels = [
+    "Panel_Alert_Frequency",
+    "Panel_Dedup_Impact",
+    "Panel_Alert_Correlation",
+    "Panel_Alert_Effectiveness",
+    "Panel_Retry_Analysis",
+    "Panel_Execution_Duration",
+  ];
+
+  return typeof props.value === "string" && alertNamePanels.includes(props.panelId);
+});
+
+const configureDedupForAlert = () => {
+  if (typeof props.value === "string") {
+    emit("configure-dedup", props.value);
+    emit("close");
+  }
+};
+
+const editAlert = () => {
+  if (typeof props.value === "string") {
+    emit("edit-alert", props.value);
+    emit("close");
+  }
+};
+
+const viewAlertHistory = () => {
+  if (typeof props.value === "string") {
+    emit("view-history", props.value);
+    emit("close");
+  }
+};
+
+const handleClickOutside = () => {
+  emit("close");
+};
+
+const handleEscape = (event: KeyboardEvent) => {
+  if (event.key === "Escape") {
+    emit("close");
+  }
+};
+
+onMounted(() => {
+  document.addEventListener("click", handleClickOutside);
+  document.addEventListener("keydown", handleEscape);
+});
+
+onUnmounted(() => {
+  document.removeEventListener("click", handleClickOutside);
+  document.removeEventListener("keydown", handleEscape);
+});
+</script>

@@ -1,0 +1,708 @@
+﻿<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <div v-if="!promqlMode && dashboardPanelData.data.type == 'sankey'">
+    <!-- source container -->
+    <div class="flex flex-row ps-3">
+      <div class="layout-name flex min-w-20 items-center whitespace-nowrap">
+        <span
+          class="rounded-default bg-badge-indigo-ol-text me-1.5 h-2 w-2 shrink-0"
+          aria-hidden="true"
+        ></span>
+        {{ t("panel.source") }}
+        <OIcon name="info-outline" size="sm" class="ms-1" />
+        <OTooltip :content="Hint" />
+      </div>
+      <span class="layout-separator ms-0.5 me-0.5 flex items-center">:</span>
+      <div
+        class="axis-container droppable scroll flex min-h-8 w-full flex-1 flex-wrap items-center border border-dashed border-transparent"
+        :class="{
+          'border-dotted border-white bg-[rgba(0,0,0,0.042)]':
+            dashboardPanelData.meta.dragAndDrop.dragging,
+          'bg-field-list-row-hover-bg transition-colors duration-200':
+            dashboardPanelData.meta.dragAndDrop.dragging &&
+            dashboardPanelData.meta.dragAndDrop.currentDragArea == 'source',
+        }"
+        @dragend="onDragEnd()"
+        @dragover="onDragOver($event, 'source')"
+        @drop="onDrop($event, 'source')"
+        @dragenter="onDragEnter($event, 'source', null)"
+        data-test="dashboard-source-layout"
+      >
+        <OButtonGroup
+          class="axis-field border-border-default border-s-badge-indigo-ol-border bg-surface-panel my-0.5 me-2 overflow-hidden border border-s-2 [&>*:not(:first-child)]:!border-s"
+          radius="sm"
+          :divided="true"
+          v-if="
+            dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields
+              ?.source
+          "
+          :draggable="isDragArmed()"
+          @dragstart="
+            onFieldDragStart(
+              $event,
+              dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields
+                ?.source,
+              'source',
+            )
+          "
+        >
+          <OButton
+            variant="ghost"
+            size="icon-chip"
+            class="!w-4 !cursor-grab"
+            @mousedown="armDrag()"
+            :data-test="`dashboard-source-item-${sourceLabel}-drag`"
+          >
+            <template #icon-left>
+              <OIcon name="drag-indicator" size="xs" class="text-text-secondary" />
+            </template>
+          </OButton>
+          <ODropdown>
+            <template #trigger>
+              <OButton
+                variant="ghost"
+                size="chip-12"
+                class="!ps-1 !pe-1"
+                :data-test="`dashboard-source-item-${sourceLabel}`"
+              >
+                <AxisFieldChipLabel :label="sourceLabel" />
+                <template #icon-right><OIcon name="arrow-drop-down" size="sm" /></template>
+              </OButton>
+            </template>
+            <div
+              class="field-function-menu-popup dashboard-sankey-chart-builder-dropdown w-[48.1875rem]! translate-y-2 overflow-hidden rounded-none p-0 shadow-md"
+              :data-test="`dashboard-source-item-${sourceLabel}-menu`"
+            >
+              <div
+                class="ps-4 pe-4 pt-0.75 pb-4"
+                :style="{
+                  width:
+                    dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]
+                      .customQuery ||
+                    dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]
+                      .fields.source.isDerived
+                      ? 'auto'
+                      : '48.1875rem',
+                }"
+              >
+                <div>
+                  <div class="me-1 mb-2">
+                    <DynamicFunctionPopUp
+                      v-model="
+                        dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]
+                          .fields.source
+                      "
+                      :allowAggregation="false"
+                      :customQuery="
+                        dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]
+                          .customQuery
+                      "
+                      :chartType="dashboardPanelData.data.type"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </ODropdown>
+          <OButton
+            variant="ghost"
+            size="icon-chip"
+            class="!w-4"
+            :data-test="`dashboard-source-item-${sourceLabel}-remove`"
+            @click="removeSource()"
+          >
+            <template #icon-left><OIcon name="close" size="xs" class="!size-2.5" /></template>
+          </OButton>
+        </OButtonGroup>
+        <div
+          class="flex min-w-0 flex-1 items-center justify-center text-center text-xs whitespace-nowrap"
+          data-test="dashboard-sankey-source-empty-hint"
+          v-if="
+            dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields
+              .source == null
+          "
+        >
+          <div>{{ Hint }}</div>
+        </div>
+      </div>
+    </div>
+    <OSeparator />
+    <!-- target container -->
+    <div class="flex flex-row ps-3">
+      <div class="layout-name flex min-w-20 items-center whitespace-nowrap">
+        <span
+          class="rounded-default bg-badge-orange-ol-text me-1.5 h-2 w-2 shrink-0"
+          aria-hidden="true"
+        ></span>
+        {{ t("panel.target") }}
+        <OIcon name="info-outline" size="sm" class="ms-1" />
+        <OTooltip :content="Hint" />
+      </div>
+      <span class="layout-separator ms-0.5 me-0.5 flex items-center">:</span>
+      <div
+        class="axis-container droppable scroll flex min-h-8 w-full flex-1 flex-wrap items-center border border-dashed border-transparent"
+        :class="{
+          'border-dotted border-white bg-[rgba(0,0,0,0.042)]':
+            dashboardPanelData.meta.dragAndDrop.dragging,
+          'bg-field-list-row-hover-bg transition-colors duration-200':
+            dashboardPanelData.meta.dragAndDrop.dragging &&
+            dashboardPanelData.meta.dragAndDrop.currentDragArea == 'target',
+        }"
+        @dragend="onDragEnd()"
+        @dragover="onDragOver($event, 'target')"
+        @drop="onDrop($event, 'target')"
+        @dragenter="onDragEnter($event, 'target', null)"
+        data-test="dashboard-target-layout"
+      >
+        <OButtonGroup
+          class="axis-field border-border-default border-s-badge-orange-ol-border bg-surface-panel my-0.5 me-2 overflow-hidden border border-s-2 [&>*:not(:first-child)]:!border-s"
+          radius="sm"
+          :divided="true"
+          v-if="
+            dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields
+              ?.target
+          "
+          :draggable="isDragArmed()"
+          @dragstart="
+            onFieldDragStart(
+              $event,
+              dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields
+                ?.target,
+              'target',
+            )
+          "
+        >
+          <OButton
+            variant="ghost"
+            size="icon-chip"
+            class="!w-4 !cursor-grab"
+            @mousedown="armDrag()"
+            :data-test="`dashboard-target-item-${targetLabel}-drag`"
+          >
+            <template #icon-left>
+              <OIcon name="drag-indicator" size="xs" class="text-text-secondary" />
+            </template>
+          </OButton>
+          <ODropdown>
+            <template #trigger>
+              <OButton
+                variant="ghost"
+                size="chip-12"
+                class="!ps-1 !pe-1"
+                :data-test="`dashboard-target-item-${targetLabel}`"
+              >
+                <AxisFieldChipLabel :label="targetLabel" />
+                <template #icon-right><OIcon name="arrow-drop-down" size="sm" /></template>
+              </OButton>
+            </template>
+            <div
+              class="field-function-menu-popup dashboard-sankey-chart-builder-dropdown w-[48.1875rem]! translate-y-2 overflow-hidden rounded-none p-0 shadow-md"
+              :data-test="`dashboard-target-item-${targetLabel}-menu`"
+            >
+              <div
+                class="ps-4 pe-4 pt-0.75 pb-4"
+                :style="{
+                  width:
+                    dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]
+                      .customQuery ||
+                    dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]
+                      .fields.target.isDerived
+                      ? 'auto'
+                      : '48.1875rem',
+                }"
+              >
+                <div>
+                  <div class="me-1 mb-2">
+                    <DynamicFunctionPopUp
+                      v-model="
+                        dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]
+                          .fields.target
+                      "
+                      :allowAggregation="false"
+                      :customQuery="
+                        dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]
+                          .customQuery
+                      "
+                      :chartType="dashboardPanelData.data.type"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </ODropdown>
+          <OButton
+            variant="ghost"
+            size="icon-chip"
+            class="!w-4"
+            :data-test="`dashboard-target-item-${targetLabel}-remove`"
+            @click="removeTarget()"
+          >
+            <template #icon-left><OIcon name="close" size="xs" class="!size-2.5" /></template>
+          </OButton>
+        </OButtonGroup>
+        <div
+          class="flex min-w-0 flex-1 items-center justify-center text-center text-xs whitespace-nowrap"
+          v-if="
+            dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields
+              .target == null
+          "
+        >
+          <div>{{ Hint }}</div>
+        </div>
+      </div>
+    </div>
+    <OSeparator />
+    <!-- value container -->
+    <div class="flex flex-row ps-3">
+      <div class="layout-name flex min-w-20 items-center whitespace-nowrap">
+        <span
+          class="rounded-default bg-badge-success-ol-text me-1.5 h-2 w-2 shrink-0"
+          aria-hidden="true"
+        ></span>
+        {{ t("panel.value") }}
+        <OIcon name="info-outline" size="sm" class="ms-1" />
+        <OTooltip :content="Hint" />
+      </div>
+      <span class="layout-separator ms-0.5 me-0.5 flex items-center">:</span>
+      <div
+        class="axis-container droppable scroll flex min-h-8 w-full flex-1 flex-wrap items-center border border-dashed border-transparent"
+        :class="{
+          'border-dotted border-white bg-[rgba(0,0,0,0.042)]':
+            dashboardPanelData.meta.dragAndDrop.dragging,
+          'bg-field-list-row-hover-bg transition-colors duration-200':
+            dashboardPanelData.meta.dragAndDrop.dragging &&
+            dashboardPanelData.meta.dragAndDrop.currentDragArea == 'value',
+        }"
+        @dragend="onDragEnd()"
+        @dragover="onDragOver($event, 'value')"
+        @drop="onDrop($event, 'value')"
+        @dragenter="onDragEnter($event, 'value', null)"
+        data-test="dashboard-value-layout"
+      >
+        <OButtonGroup
+          class="axis-field border-border-default border-s-badge-success-ol-border bg-surface-panel my-0.5 me-2 overflow-hidden border border-s-2 [&>*:not(:first-child)]:!border-s"
+          radius="sm"
+          :divided="true"
+          v-if="
+            dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields
+              ?.value
+          "
+          :draggable="isDragArmed()"
+          @dragstart="
+            onFieldDragStart(
+              $event,
+              dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields
+                ?.value,
+              'value',
+            )
+          "
+        >
+          <OButton
+            variant="ghost"
+            size="icon-chip"
+            class="!w-4 !cursor-grab"
+            @mousedown="armDrag()"
+            :data-test="`dashboard-value-item-${valueLabel}-drag`"
+          >
+            <template #icon-left>
+              <OIcon name="drag-indicator" size="xs" class="text-text-secondary" />
+            </template>
+          </OButton>
+          <ODropdown>
+            <template #trigger>
+              <OButton
+                variant="ghost"
+                size="chip-12"
+                class="!ps-1 !pe-1"
+                :data-test="`dashboard-value-item-${valueLabel}`"
+              >
+                <AxisFieldChipLabel :label="valueLabel" />
+                <template #icon-right><OIcon name="arrow-drop-down" size="sm" /></template>
+              </OButton>
+            </template>
+            <div
+              class="field-function-menu-popup dashboard-sankey-chart-builder-dropdown w-[48.1875rem]! translate-y-2 overflow-hidden rounded-none p-0 shadow-md"
+              :data-test="`dashboard-value-item-${valueLabel}-menu`"
+            >
+              <div
+                class="ps-4 pe-4 pt-0.75 pb-4"
+                :style="{
+                  width:
+                    dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]
+                      .customQuery ||
+                    dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]
+                      .fields.value.isDerived
+                      ? 'auto'
+                      : '48.1875rem',
+                }"
+              >
+                <div>
+                  <div class="me-1 mb-2">
+                    <DynamicFunctionPopUp
+                      v-model="
+                        dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]
+                          .fields.value
+                      "
+                      :allowAggregation="true"
+                      :customQuery="
+                        dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]
+                          .customQuery
+                      "
+                      :chartType="dashboardPanelData.data.type"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+          </ODropdown>
+          <OButton
+            variant="ghost"
+            size="icon-chip"
+            class="!w-4"
+            :data-test="`dashboard-value-item-${valueLabel}-remove`"
+            @click="removeValue()"
+          >
+            <template #icon-left><OIcon name="close" size="xs" class="!size-2.5" /></template>
+          </OButton>
+        </OButtonGroup>
+        <div
+          class="flex min-w-0 flex-1 items-center justify-center text-center text-xs whitespace-nowrap"
+          v-if="
+            dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields
+              .value == null
+          "
+        >
+          <div>{{ Hint }}</div>
+        </div>
+      </div>
+    </div>
+    <template v-if="showJoinsAndFilters">
+      <OSeparator />
+      <DashboardJoinsOption :dashboardData="dashboardData"></DashboardJoinsOption>
+      <OSeparator />
+      <!-- filters container -->
+      <DashboardFiltersOption :dashboardData="dashboardData"></DashboardFiltersOption>
+    </template>
+  </div>
+</template>
+
+<script lang="ts">
+import { defineComponent, ref, reactive, watch, computed, inject } from "vue";
+import { useI18nTyped, raw } from "@/types/i18n";
+import useDashboardPanelData from "../../../composables/dashboard/useDashboardPanel";
+import useDragHandle from "@/composables/useDragHandle";
+import { getImageURL } from "../../../utils/zincutils";
+import useNotifications from "@/composables/useNotifications";
+import DashboardFiltersOption from "@/views/Dashboards/addPanel/DashboardFiltersOption.vue";
+import DynamicFunctionPopUp from "@/components/dashboards/addPanel/dynamicFunction/DynamicFunctionPopUp.vue";
+import { buildSQLQueryFromInput } from "@/utils/dashboard/dashboardAutoQueryBuilder";
+import DashboardJoinsOption from "@/views/Dashboards/addPanel/DashboardJoinsOption.vue";
+import { MAX_FIELD_LABEL_CHARS } from "@/utils/dashboard/constants";
+import OButtonGroup from "@/lib/core/Button/OButtonGroup.vue";
+import OButton from "@/lib/core/Button/OButton.vue";
+import OIcon from "@/lib/core/Icon/OIcon.vue";
+import OTooltip from "@/lib/overlay/Tooltip/OTooltip.vue";
+import ODropdown from "@/lib/overlay/Dropdown/ODropdown.vue";
+import OSeparator from "@/lib/core/Separator/OSeparator.vue";
+import AxisFieldChipLabel from "@/components/dashboards/addPanel/AxisFieldChipLabel.vue";
+
+export default defineComponent({
+  name: "DashboardSankeyChartBuilder",
+  components: {
+    AxisFieldChipLabel,
+    OSeparator,
+    OButtonGroup,
+    OButton,
+    ODropdown,
+    DashboardFiltersOption,
+    DynamicFunctionPopUp,
+    DashboardJoinsOption,
+    OIcon,
+    OTooltip,
+  },
+  props: ["dashboardData"],
+  setup() {
+    const { t } = useI18nTyped();
+    const { showErrorNotification } = useNotifications();
+    const expansionItems = reactive({
+      source: true,
+      target: true,
+      value: true,
+      filter: false,
+    });
+
+    const dashboardPanelDataPageKey = inject("dashboardPanelDataPageKey", "dashboard");
+
+    const {
+      dashboardPanelData,
+      addSource,
+      addTarget,
+      addValue,
+      removeSource,
+      removeTarget,
+      removeValue,
+      addFilteredItem,
+      promqlMode,
+      cleanupDraggingFields,
+    } = useDashboardPanelData(dashboardPanelDataPageKey, t);
+    const triggerOperators = [
+      { label: t("dashboard.count"), value: "count" },
+      { label: t("dashboard.countDistinct"), value: "count-distinct" },
+      { label: t("dashboard.sum"), value: "sum" },
+      { label: t("dashboard.avg"), value: "avg" },
+      { label: t("dashboard.min"), value: "min" },
+      { label: t("dashboard.max"), value: "max" },
+      {
+        label: raw("P50"),
+        value: "p50",
+      },
+      {
+        label: raw("P90"),
+        value: "p90",
+      },
+      {
+        label: raw("P95"),
+        value: "p95",
+      },
+      {
+        label: raw("P99"),
+        value: "p99",
+      },
+    ];
+
+    watch(
+      () => dashboardPanelData.meta.dragAndDrop.dragging,
+      (newVal: boolean, oldVal: boolean) => {
+        if (oldVal == false && newVal == true) {
+          expansionItems.source = true;
+          expansionItems.target = true;
+          expansionItems.value = true;
+          expansionItems.filter = true;
+        }
+      },
+    );
+
+    const onDrop = (e: any, targetAxis: string) => {
+      e.stopPropagation();
+      // move the items  between axis or from the field list
+      // check if the source is from axis or field list
+      if (dashboardPanelData.meta.dragAndDrop.dragSource === "fieldList") {
+        // add the item to the target list
+        const dragElement = dashboardPanelData.meta.dragAndDrop.dragElement;
+        if (!dragElement) {
+          return;
+        }
+
+        switch (targetAxis) {
+          case "source":
+            addSource(dragElement);
+            break;
+          case "target":
+            addTarget(dragElement);
+            break;
+          case "value":
+            addValue(dragElement);
+            break;
+          case "f":
+            addFilteredItem(dragElement);
+            break;
+        }
+      } else {
+        // move the item from field list to axis
+        const dragElement = dashboardPanelData.meta.dragAndDrop.dragElement;
+
+        const currentQueryField =
+          dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields;
+        if (targetAxis !== "f") {
+          if (
+            (targetAxis === "source" && currentQueryField.source) ||
+            (targetAxis === "target" && currentQueryField.target) ||
+            (targetAxis === "value" && currentQueryField.value)
+          ) {
+            const maxAllowedAxisFields = 1;
+
+            const errorMessage = t("dashboard.dashboardSankeyChartBuilder.maxFieldAllowed", {
+              count: maxAllowedAxisFields,
+              axis: targetAxis.toUpperCase(),
+            });
+
+            showErrorNotification(errorMessage);
+            cleanupDraggingFields();
+            return;
+          }
+
+          // Remove from the original axis
+          const dragSource = dashboardPanelData.meta.dragAndDrop.dragSource;
+          if (dragSource === "source") {
+            removeSource();
+          } else if (dragSource === "target") {
+            removeTarget();
+          } else if (dragSource === "value") {
+            removeValue();
+          }
+        }
+        if (targetAxis === "f") {
+          return;
+        }
+
+        // find first arg which is of type field
+        const firstFieldTypeArg = dragElement?.args?.find(
+          (arg: any) => arg?.type === "field",
+        )?.value;
+
+        if (!firstFieldTypeArg) {
+          showErrorNotification(t("dashboard.dashboardSankeyChartBuilder.withoutFieldDrag"));
+          cleanupDraggingFields();
+          return;
+        }
+
+        const fieldObj = {
+          name: firstFieldTypeArg.field,
+          streamAlias: firstFieldTypeArg.streamAlias,
+        };
+
+        // Add to the new axis
+        if (targetAxis === "source") {
+          addSource(fieldObj);
+        } else if (targetAxis === "target") {
+          addTarget(fieldObj);
+        } else if (targetAxis === "value") {
+          addValue(fieldObj);
+        }
+      }
+
+      cleanupDraggingFields();
+    };
+
+    const onDragStart = (e: any) => {
+      e.preventDefault();
+    };
+
+    const onDragOver = (e: any, _columnData?: string) => {
+      e.preventDefault();
+    };
+    const onDragEnter = (e: any, area: string, index: any) => {
+      if (dashboardPanelData.meta.dragAndDrop.dragSource != "fieldList" && area === "f") {
+        e.preventDefault();
+        return;
+      }
+      dashboardPanelData.meta.dragAndDrop.targetDragIndex =
+        index != null && index >= 0 ? index : dashboardPanelData.meta.dragAndDrop.targetDragIndex;
+      dashboardPanelData.meta.dragAndDrop.currentDragArea = area;
+      e.preventDefault();
+    };
+
+    const onFieldDragStart = (e: any, item: any, axis: string) => {
+      dashboardPanelData.meta.dragAndDrop.dragging = true;
+      dashboardPanelData.meta.dragAndDrop.dragElement = item;
+      dashboardPanelData.meta.dragAndDrop.dragSource = axis;
+    };
+
+    const onDragEnd = () => {
+      cleanupDraggingFields();
+    };
+
+    // Handle-gated drag: chips drag only from the grip, not the label.
+    const { arm: armDrag, isArmed: isDragArmed } = useDragHandle();
+    const Hint = computed(() => {
+      switch (dashboardPanelData.data.type) {
+        case "sankey":
+          return t("dashboard.oneFieldMessage");
+        default:
+          return t("dashboard.maxtwofieldMessage");
+      }
+    });
+
+    const commonBtnLabel = (field: any) => {
+      if (
+        dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].customQuery
+      ) {
+        return field.alias;
+      }
+      const label = buildSQLQueryFromInput(
+        field,
+        dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex]?.joins?.length
+          ? dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields
+              ?.stream
+          : "",
+      );
+
+      return label?.length > MAX_FIELD_LABEL_CHARS
+        ? label.substring(0, MAX_FIELD_LABEL_CHARS) + "..."
+        : label;
+    };
+
+    const sourceLabel = computed(() => {
+      const sourceField =
+        dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields.source;
+      return commonBtnLabel(sourceField);
+    });
+
+    const targetLabel = computed(() => {
+      const targetField =
+        dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields.target;
+      return commonBtnLabel(targetField);
+    });
+
+    const valueLabel = computed(() => {
+      const valueField =
+        dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex].fields.value;
+      return commonBtnLabel(valueField);
+    });
+
+    // Joins and Filters hide themselves in custom-SQL mode; the separators
+    // around them must follow the same condition or they stack into a
+    // double border.
+    const showJoinsAndFilters = computed(() => {
+      const currentQuery =
+        dashboardPanelData.data.queries[dashboardPanelData.layout.currentQueryIndex];
+      return !(currentQuery?.customQuery && dashboardPanelData.data.queryType === "sql");
+    });
+
+    return {
+      t,
+      dashboardPanelData,
+      showJoinsAndFilters,
+      removeSource,
+      removeTarget,
+      removeValue,
+      triggerOperators,
+      pagination: ref({
+        rowsPerPage: 0,
+      }),
+      model: ref([]),
+      tab: ref("General"),
+      getImageURL,
+      onDrop,
+      onDragEnter,
+      onDragStart,
+      onDragEnd,
+      onDragOver,
+      armDrag,
+      isDragArmed,
+      expansionItems,
+      Hint,
+      promqlMode,
+      sourceLabel,
+      targetLabel,
+      valueLabel,
+      onFieldDragStart,
+    };
+  },
+});
+</script>

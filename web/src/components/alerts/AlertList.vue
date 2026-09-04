@@ -1,0 +1,3478 @@
+﻿<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<!-- eslint-disable vue/v-on-event-hyphenation -->
+<!-- eslint-disable vue/attribute-hyphenation -->
+<template>
+  <div data-test="alert-list-page" class="flex h-full flex-col">
+    <OPageLayout
+      bleed
+      v-if="!showAddAlertDialog && !showImportAlertDialog"
+      :title="t('alerts.header')"
+      icon="shield-alert-outline"
+      :subtitle="t('alerts.subtitle')"
+      tabs-below
+    >
+      <!-- The header names the GROUP the four tabs form — "Alerts" — not the
+           page; the active tab says which sibling you are on. Same title,
+           subtitle and icon on all four (PipelineSectionTabs makes the same
+           trade). -->
+      <template #header-tabs>
+        <AlertSectionTabs />
+      </template>
+
+      <template #actions>
+        <!-- The provider behind the Terraform export tab, which is otherwise
+             only discoverable once the export dialog is already open. -->
+        <IacRegistryLinks data-test="alert-list-iac-registries" />
+        <!-- Import button -->
+        <OButton
+          :class="isCompactToolbar ? 'min-w-0! px-2! py-0!' : ''"
+          variant="outline"
+          size="sm"
+          @click="importAlert"
+          data-test="alert-import"
+          icon-left="upload-file"
+        >
+          <template v-if="!isCompactToolbar">{{ t(`dashboard.import`) }}</template>
+          <OTooltip
+            v-if="isCompactToolbar"
+            :content="t('dashboard.import')"
+            side="bottom"
+            shortcut-id="alertsImport"
+          />
+        </OButton>
+        <!-- Add button — routes to anomaly creation on anomaly tab, alert creation otherwise -->
+        <OButton
+          data-test="alert-list-add-alert-btn"
+          variant="primary"
+          size="sm"
+          icon-left="add"
+          :disabled="!destinations.length || !templates.length"
+          :title="!destinations.length ? t('alerts.noDestinations') : ''"
+          @click="
+            activeTab === 'anomalyDetection'
+              ? router.push({
+                  name: 'addAnomalyDetection',
+                  query: {
+                    org_identifier: store.state.selectedOrganization.identifier,
+                    folder: activeFolderId,
+                    tab: activeTab,
+                  },
+                })
+              : showAddUpdateFn({})
+          "
+          >{{ t(`alerts.add`) }}</OButton
+        >
+      </template>
+
+      <div data-test="alert-list-splitter" class="flex min-h-0 flex-1">
+        <!-- Left: FolderList -->
+        <div class="w-rail h-full shrink-0">
+          <div class="h-full">
+            <FolderList type="alerts" @update:activeFolderId="updateActiveFolderId" />
+          </div>
+        </div>
+        <!-- Right: Table -->
+        <div class="h-full min-w-0 flex-1">
+          <div class="bg-card-glass-bg flex h-full flex-col">
+            <!-- Alert List Table (shows all alert types including anomaly detection rows) -->
+            <OTable
+              class="min-h-0 flex-1"
+              :frame="false"
+              v-model:selected-ids="selectedAlertIds"
+              selection="multiple"
+              data-test="alert-list-table"
+              :data="displayedAlerts"
+              :columns="columns"
+              show-index
+              row-key="alert_id"
+              :loading="loading"
+              pagination="client"
+              :page-size="pageSize"
+              :page-size-options="pageSizeOptions"
+              width="100%"
+              :show-global-filter="false"
+              :default-columns="false"
+              :enable-column-resize="true"
+              :persist-columns="true"
+              table-id="alerts-alert-list"
+              :row-class="alertRowClass"
+              :get-row-style="alertRowStyle"
+              @row-click="triggerExpand"
+            >
+              <!-- Summary strip: at-a-glance operational counts for the folder.
+                     Rendered via OTable's #subheader slot so it sits BELOW the
+                     search/tabs and above the rows. Always rendered (skeleton
+                     while loading) so data arriving never shifts the layout. -->
+              <template #subheader>
+                <div
+                  class="px-page-edge border-table-row-divider border-b py-1.5"
+                  data-test="alert-list-summary"
+                >
+                  <OStatStrip
+                    :items="summaryStats"
+                    :loading="loading"
+                    selectable
+                    :selected-key="stateFilter"
+                    default-key="total"
+                    @select="onStatSelect"
+                  />
+                </div>
+              </template>
+
+              <!-- Toolbar: alert-type filter + search (inline folder scope) + refresh. -->
+              <template #toolbar>
+                <div class="flex w-full items-center gap-2">
+                  <OToggleGroup
+                    :model-value="activeTab"
+                    data-test="alert-list-tabs"
+                    @update:model-value="(v) => onAlertTabChange(v as string)"
+                  >
+                    <OToggleGroupItem
+                      v-for="tab in alertTabs"
+                      :key="tab.value"
+                      :value="tab.value"
+                      size="sm"
+                      :icon-left="tab.icon"
+                      :data-test="`alert-list-tab-${tab.value}`"
+                    >
+                      {{ tab.label }}
+                    </OToggleGroupItem>
+                  </OToggleGroup>
+                  <div class="min-w-0 flex-1">
+                    <OInput
+                      v-model="dynamicQueryModel"
+                      :placeholder="
+                        searchAcrossFolders ? t('dashboard.searchAcross') : t('alerts.search')
+                      "
+                      :clearable="searchAcrossFolders"
+                      @clear="clearSearchHistory"
+                      data-test="alert-list-search-input"
+                      class="w-full"
+                    >
+                      <template #icon-left>
+                        <OIcon name="search" size="sm" />
+                      </template>
+                      <template #icon-right>
+                        <OToggleGroup
+                          :model-value="searchAcrossFolders ? 'all' : 'this'"
+                          type="single"
+                          class="me-1 self-center"
+                          @update:model-value="(v) => (searchAcrossFolders = v === 'all')"
+                        >
+                          <OToggleGroupItem
+                            value="this"
+                            size="xs"
+                            icon-left="folder-outline"
+                            data-test="alert-list-search-scope-current"
+                            :title="t('alerts.searchThisFolderTooltip')"
+                            >{{ t("alerts.searchThisFolder") }}</OToggleGroupItem
+                          >
+                          <OToggleGroupItem
+                            value="all"
+                            size="xs"
+                            icon-left="search"
+                            data-test="alert-list-search-across-folders-toggle"
+                            :title="t('alerts.searchAllFoldersTooltip')"
+                            >{{ t("alerts.searchAllFolders") }}</OToggleGroupItem
+                          >
+                        </OToggleGroup>
+                      </template>
+                    </OInput>
+                  </div>
+                </div>
+              </template>
+              <template #toolbar-trailing>
+                <OButton
+                  variant="outline"
+                  size="icon-sm"
+                  icon-left="refresh"
+                  :loading="loading"
+                  data-test="alert-list-refresh-btn"
+                  @click="refreshAlerts"
+                >
+                  <OTooltip
+                    side="bottom"
+                    :content="t('alerts.reloadAlertsTooltip')"
+                    shortcut-id="alertsRefresh"
+                  />
+                </OButton>
+              </template>
+
+              <template #cell-name="{ row }">
+                <div
+                  class="flex min-w-0 items-center gap-2 overflow-hidden"
+                  :data-test="`alert-list-${row.name}-name-cell`"
+                >
+                  <!-- Type chip: glyph + colour by alert type -->
+                  <span
+                    class="rounded-default bg-surface-subtle grid h-6 w-6 shrink-0 place-items-center"
+                  >
+                    <OIcon :name="typeIconName(row)" size="sm" :class="typeIconClass(row)" />
+                  </span>
+                  <span class="truncate">{{ row.name || "--" }}</span>
+                  <template v-if="row.alert_type === 'Composite'">
+                    <OTag
+                      variant="warning-soft"
+                      size="sm"
+                      :label="t('alerts.compositeAlert')"
+                      :data-test="`alert-list-composite-badge-${row.alert_id}`"
+                    />
+                    <span
+                      class="text-text-secondary text-xs whitespace-nowrap"
+                      :data-test="`alert-list-child-count-${row.alert_id}`"
+                    >
+                      {{ t("alerts.composite.childrenCount", { count: row.child_count }) }}
+                    </span>
+                  </template>
+                  <span
+                    v-if="
+                      row.referenced_by_composite_count > 0 ||
+                      (referenceDrawerOpen &&
+                        !referenceConflictCode &&
+                        referenceAlertId === row.alert_id)
+                    "
+                    :data-test="`alert-list-reference-count-${row.alert_id}`"
+                  >
+                    <CompositeReferencesDrawer
+                      :open="
+                        referenceDrawerOpen &&
+                        !referenceConflictCode &&
+                        referenceAlertId === row.alert_id
+                      "
+                      :reference-count="row.referenced_by_composite_count ?? 0"
+                      :references="referenceRows"
+                      :hidden-reference-count="hiddenReferenceCount"
+                      @update:open="handleReferenceOpen($event, row)"
+                      @navigate="navigateToReference"
+                    />
+                  </span>
+                  <!-- An SLO alert has no stream, so this is the only thing on
+                       the row that says what it watches. The badge marks the
+                       family; the label names the SLO and goes there. -->
+                  <template v-if="isSloRow(row)">
+                    <!-- `indigo-soft`, not teal: teal is already `scheduled` in
+                         badgeGroups, and two alert families wearing the same
+                         colour in one table is worse than no colour at all. -->
+                    <OTag
+                      variant="indigo-soft"
+                      size="sm"
+                      :label="t('alerts.sloBadge')"
+                      :data-test="`alert-list-${row.name}-slo-badge`"
+                    />
+                    <!-- A real <button>, not a clickable span: this is the
+                         row's second navigation target and has to be reachable
+                         from the keyboard. `@click.stop` is belt-and-braces —
+                         OTableBodyRow's own click handler already ignores
+                         events originating in a button — but the row click
+                         navigates elsewhere, and that is not a default worth
+                         depending on another component to keep. -->
+                    <button
+                      v-if="row.slo_id"
+                      type="button"
+                      class="text-text-link truncate hover:underline"
+                      :aria-label="t('alerts.sloColumn') + ': ' + sloLabel(row)"
+                      :data-test="`alert-list-${row.name}-slo-link`"
+                      @click.stop="goToSlo(row)"
+                    >
+                      {{ sloLabel(row) }}
+                    </button>
+                  </template>
+                </div>
+                <!-- Composite rows have no stream/query summary: show the
+                     name-resolved expression the backend supplied instead. -->
+                <span
+                  v-if="row.alert_type === 'Composite' && row.conditions && row.conditions !== '--'"
+                  class="text-text-secondary min-w-0 truncate text-xs"
+                  :title="row.conditions"
+                  :data-test="`alert-list-composite-expression-${row.alert_id}`"
+                >
+                  {{ row.conditions }}
+                </span>
+                <OTooltip
+                  v-if="row.name"
+                  :content="row.name"
+                  content-class="max-w-100 whitespace-normal break-words text-xs"
+                />
+              </template>
+
+              <template #cell-owner="{ row }">
+                <OUserCell :value="row.owner" />
+              </template>
+
+              <template #cell-frequency="{ row }">
+                {{
+                  row.frequency
+                    ? row.frequency_type == "cron"
+                      ? row.frequency
+                      : t("pipeline.frequencyMins", { count: row.frequency })
+                    : "--"
+                }}
+              </template>
+
+              <template #cell-last_triggered_at="{ row }">
+                <span class="inline-flex min-w-0 items-center gap-1.5">
+                  <span
+                    v-if="['hot', 'warm'].includes(recencyLevel(row.last_triggered_at_raw))"
+                    class="h-1.5 w-1.5 shrink-0 rounded-full"
+                    :class="
+                      recencyLevel(row.last_triggered_at_raw) === 'hot'
+                        ? 'bg-warning-500 motion-safe:animate-pulse'
+                        : 'bg-text-muted'
+                    "
+                  />
+                  <OTimeCell
+                    :value="row.last_triggered_at_raw"
+                    unit="us"
+                    mode="relative"
+                    :timezone="store.state.timezone"
+                    :empty-label="t('alerts.anomaly.retrainNever')"
+                  />
+                </span>
+              </template>
+
+              <template #cell-last_satisfied_at="{ row }">
+                <OTimeCell
+                  :value="row.last_satisfied_at"
+                  unit="iso"
+                  mode="absolute"
+                  :timezone="store.state.timezone"
+                  :empty-label="t('alerts.anomaly.retrainNever')"
+                />
+              </template>
+
+              <template #cell-status="{ row }">
+                <span v-if="row.status && row.status !== '--'" class="relative inline-flex">
+                  <OTag type="alertStatus" :value="row.status" />
+                  <OTooltip
+                    v-if="row.status === 'failed' && row.last_error"
+                    :max-width="'25rem'"
+                    :content="row.last_error"
+                  />
+                </span>
+                <span v-else class="text-text-body">—</span>
+              </template>
+
+              <!-- Priority (PT-3). Unset renders an em dash, not a chip:
+                   most alerts have none and a wall of grey chips is noise. -->
+              <template #cell-priority="{ row }">
+                <OTag
+                  v-if="row.priority"
+                  type="alertPriority"
+                  :value="`p${row.priority}`"
+                  :data-test="`alert-list-${row.name}-priority`"
+                />
+                <span v-else class="text-text-secondary">—</span>
+              </template>
+
+              <!-- Tags (PT-6). Three visible + overflow count, so an alert
+                   carrying 64 tags cannot blow out the row height. -->
+              <template #cell-tags="{ row }">
+                <div v-if="row.tags?.length" class="flex flex-wrap items-center gap-1">
+                  <OTag
+                    v-for="tag in row.tags.slice(0, 3)"
+                    :key="tag"
+                    type="exampleChip"
+                    value="dim"
+                    :label="tag"
+                    :data-test="`alert-list-${row.name}-tag`"
+                  />
+                  <OTooltip v-if="row.tags.length > 3" :content="row.tags.join(', ')">
+                    <span class="text-text-secondary text-2xs">+{{ row.tags.length - 3 }}</span>
+                  </OTooltip>
+                </div>
+                <span v-else class="text-text-secondary">—</span>
+              </template>
+
+              <!--
+                Multi-alert fan-out summary (§5.4). Both counts come from the
+                rollup row and are PRE-cap, so they keep telling the truth when
+                the M-6 cap truncates what is actually tracked. Each is rendered
+                with a `≥` when its persisted lower-bound marker says the fetch
+                page could not prove exactness — under-reporting silently is the
+                failure M-6 forbids.
+              -->
+              <template #cell-groups="{ row }">
+                <div
+                  v-if="
+                    row.multi_alert &&
+                    row.groups_observed !== undefined &&
+                    row.groups_observed !== null
+                  "
+                  class="flex flex-wrap items-center gap-1"
+                  :data-test="`alert-list-${row.name}-groups`"
+                >
+                  <OTag
+                    v-if="row.groups_firing"
+                    type="alertLevel"
+                    value="critical"
+                    :label="
+                      t('alerts.groups.firingCount', {
+                        count: formatGroupCount(
+                          row.groups_firing,
+                          row.groups_firing_is_lower_bound,
+                        ),
+                      })
+                    "
+                    size="sm"
+                  />
+                  <span class="text-text-secondary text-2xs">
+                    {{
+                      t("alerts.groups.ofNGroups", {
+                        count: formatGroupCount(
+                          row.groups_observed,
+                          row.groups_observed_is_lower_bound,
+                        ),
+                      })
+                    }}
+                  </span>
+                </div>
+                <span v-else class="text-text-secondary">—</span>
+              </template>
+
+              <template #cell-last_outcome="{ row }">
+                <!--
+                  Only rendered for enabled alerts: a disabled alert keeps
+                  whatever outcome it last recorded, so showing it would display
+                  "Firing" forever on something that is not running.
+                -->
+                <OTooltip v-if="showRunOutcome(row)" :content="runOutcomeTooltip(row)">
+                  <OTag
+                    type="alertState"
+                    :value="row.last_outcome"
+                    size="sm"
+                    :data-test="`alert-list-${row.name}-last-outcome`"
+                  />
+                </OTooltip>
+                <span v-else class="text-text-body">—</span>
+              </template>
+
+              <template #cell-folder_name="{ row }">
+                <div @click.stop="updateActiveFolderId(row.folder_name.id)">
+                  {{ row.folder_name.name }}
+                </div>
+              </template>
+
+              <template #cell-actions="{ row }">
+                <div class="actions-container flex items-center">
+                  <div
+                    data-test="alert-list-loading-alert"
+                    v-if="alertStateLoadingMap[row.uuid]"
+                    style="display: inline-block; width: 2.07125rem; height: auto"
+                    class="ms-1 flex items-center justify-center"
+                    :title="row.enabled ? t('common.turningOff') : t('common.turningOn')"
+                  >
+                    <OSpinner size="xs" />
+                  </div>
+                  <OButton
+                    v-else
+                    :data-row-action="row.enabled ? 'pause' : 'resume'"
+                    :data-test="`alert-list-${row.name}-pause-start-alert`"
+                    class="ms-1"
+                    :variant="row.enabled ? 'ghost-destructive' : 'ghost-success'"
+                    size="icon-sm"
+                    :icon-left="row.enabled ? 'pause' : 'play-arrow'"
+                    @click.stop="toggleAlertState(row)"
+                  >
+                    <OTooltip
+                      side="bottom"
+                      :content="row.enabled ? t('alerts.pause') : t('alerts.start')"
+                      :shortcut-id="row.enabled ? 'alertsRowPause' : undefined"
+                    />
+                  </OButton>
+                  <OButton
+                    data-row-action="edit"
+                    :data-test="`alert-list-${row.name}-update-alert`"
+                    variant="ghost"
+                    size="icon-sm"
+                    icon-left="edit"
+                    @click.stop="editAlert(row)"
+                  >
+                    <OTooltip
+                      side="bottom"
+                      :content="t('alerts.edit')"
+                      shortcut-id="alertsRowEdit"
+                    />
+                  </OButton>
+                  <!-- Clone is disabled for SLO alerts (D1). The explanation
+                       hangs off this WRAPPER, not off the button: a disabled
+                       button receives no pointer events, so a tooltip anchored
+                       to it would never open — leaving a greyed-out control
+                       with no way to find out why. -->
+                  <span class="inline-flex">
+                    <OTooltip
+                      v-if="isSloRow(row)"
+                      side="bottom"
+                      :content="t('alerts.sloCloneDisabled')"
+                    />
+                    <OButton
+                      data-row-action="duplicate"
+                      variant="ghost"
+                      size="icon-sm"
+                      icon-left="content-copy"
+                      :disabled="isSloRow(row)"
+                      :aria-label="isSloRow(row) ? t('alerts.sloCloneDisabled') : t('alerts.clone')"
+                      @click.stop="duplicateAlert(row)"
+                      :data-test="`alert-list-${row.name}-clone-alert`"
+                    >
+                      <OTooltip
+                        v-if="!isSloRow(row)"
+                        side="bottom"
+                        :content="t('alerts.clone')"
+                        shortcut-id="alertsRowDuplicate"
+                      />
+                    </OButton>
+                  </span>
+                  <!-- Hidden proxies so the row-hover shortcuts work for
+                         actions that live in the more-menu dropdown (which is
+                         teleported out of the row DOM): x = export, Del = delete. -->
+                  <button
+                    type="button"
+                    data-row-action="export"
+                    class="hidden"
+                    tabindex="-1"
+                    aria-hidden="true"
+                    @click.stop="exportAlert(row)"
+                  />
+                  <button
+                    type="button"
+                    data-row-action="delete"
+                    class="hidden"
+                    tabindex="-1"
+                    aria-hidden="true"
+                    @click.stop="showDeleteDialogFn({ row })"
+                  />
+                  <ODropdown>
+                    <template #trigger>
+                      <OButton
+                        variant="ghost"
+                        size="icon-sm"
+                        icon-left="more-vert"
+                        @click.stop="openMenu($event, row)"
+                        :data-test="`alert-list-${row.name}-more-options`"
+                      />
+                    </template>
+                    <ODropdownItem
+                      :data-test="`alert-list-${row.name}-move-alert`"
+                      @select="moveAlertToAnotherFolder(row)"
+                    >
+                      <template #icon-left>
+                        <OIcon name="drive-file-move" size="sm" />
+                      </template>
+                      {{ t("common.move") }}
+                    </ODropdownItem>
+                    <ODropdownSeparator />
+                    <ODropdownItem
+                      :data-test="`alert-list-${row.name}-delete-alert`"
+                      variant="destructive"
+                      shortcut-id="alertsRowDelete"
+                      @select="showDeleteDialogFn({ row })"
+                    >
+                      <template #icon-left>
+                        <OIcon name="delete" size="sm" />
+                      </template>
+                      {{ t("alerts.delete") }}
+                    </ODropdownItem>
+                    <ODropdownSeparator />
+                    <ODropdownItem
+                      :data-test="`alert-list-${row.name}-export-alert`"
+                      shortcut-id="alertsRowExport"
+                      @select="exportAlert(row)"
+                    >
+                      <template #icon-left>
+                        <OIcon size="sm" name="download" />
+                      </template>
+                      {{ t("common.export") }}
+                    </ODropdownItem>
+                    <ODropdownSeparator />
+                    <!-- Anomaly Detection: Trigger Detection + Re-train -->
+                    <template v-if="row.type === 'anomaly'">
+                      <ODropdownItem
+                        :data-test="`alert-list-${row.name}-trigger-detection`"
+                        @select="triggerAlert(row)"
+                      >
+                        <template #icon-left>
+                          <OIcon size="sm" name="sound-sampler" />
+                        </template>
+                        {{ t("alerts.triggerDetection") }}
+                      </ODropdownItem>
+                      <ODropdownItem
+                        :data-test="`alert-list-${row.name}-retrain-anomaly`"
+                        @select="retrainAnomaly(row)"
+                      >
+                        <template #icon-left>
+                          <OIcon size="sm" name="replay" />
+                        </template>
+                        {{ t("alerts.retrain") }}
+                      </ODropdownItem>
+                    </template>
+                    <!-- Regular alerts: Trigger Alert item -->
+                    <ODropdownItem
+                      v-else
+                      :data-test="`alert-list-${row.name}-trigger-alert`"
+                      @select="triggerAlert(row)"
+                    >
+                      <template #icon-left>
+                        <OIcon size="sm" name="sound-sampler" />
+                      </template>
+                      {{ t("alerts.triggerAlert") }}
+                    </ODropdownItem>
+                  </ODropdown>
+                </div>
+              </template>
+
+              <template #empty>
+                <OEmptyState
+                  v-if="!templates.length"
+                  size="hero"
+                  preset="no-alert-templates"
+                  :description="t('alerts.noTemplatesMsg')"
+                  data-test="alert-list-create-template-text"
+                  @action="routeTo('alertTemplates')"
+                />
+                <OEmptyState
+                  v-else-if="!destinations.length"
+                  size="hero"
+                  preset="no-alert-destinations"
+                  :description="t('alerts.noDestinationsMsg')"
+                  data-test="alert-list-create-destination-text"
+                  @action="routeTo('alertDestinations')"
+                />
+                <OEmptyState
+                  v-else
+                  size="hero"
+                  preset="no-alerts"
+                  :filtered="!!(filterQuery || searchQuery || stateFilter)"
+                  @action="
+                    (id) =>
+                      id === 'clear-filters'
+                        ? ((filterQuery = ''), (searchQuery = ''), (stateFilter = null))
+                        : showAddUpdateFn({})
+                  "
+                />
+              </template>
+
+              <template #bottom>
+                <div class="flex h-12 w-full items-center justify-between gap-1">
+                  <div class="flex min-w-25 items-center text-xs font-normal">
+                    <template v-if="selectedAlerts.length > 0"
+                      >{{ selectedAlerts.length }} {{ t("alerts.conditionOf") }} {{ resultTotal }}
+                      {{ t("alerts.selectedLabel") }}</template
+                    >
+                    <template v-else>{{ resultTotal }} {{ t("alerts.header") }}</template>
+                  </div>
+
+                  <OButton
+                    v-if="selectedAlerts.length > 0"
+                    data-test="alert-list-move-across-folders-btn"
+                    variant="outline"
+                    size="sm"
+                    icon-left="drive-file-move"
+                    @click="moveMultipleAlerts"
+                    >{{ t("common.move") }}</OButton
+                  >
+                  <OButton
+                    v-if="selectedAlerts.length > 0"
+                    data-test="alert-list-export-alerts-btn"
+                    variant="outline"
+                    size="sm"
+                    icon-left="download"
+                    @click="multipleExportAlert"
+                    >{{ t("common.export") }}</OButton
+                  >
+                  <OButton
+                    v-if="selectedAlerts.length > 0"
+                    data-test="alert-list-pause-alerts-btn"
+                    variant="outline"
+                    size="sm"
+                    icon-left="pause"
+                    @click="bulkToggleAlerts('pause')"
+                    >{{ t("alerts.pause") }}</OButton
+                  >
+                  <OButton
+                    v-if="selectedAlerts.length > 0"
+                    data-test="alert-list-unpause-alerts-btn"
+                    variant="outline"
+                    size="sm"
+                    icon-left="play-arrow"
+                    @click="bulkToggleAlerts('resume')"
+                    >{{ t("alerts.resume") }}</OButton
+                  >
+                  <OButton
+                    v-if="selectedAlerts.length > 0"
+                    data-test="alert-list-delete-alerts-btn"
+                    variant="outline-destructive"
+                    size="sm"
+                    icon-left="delete"
+                    :loading="bulkDeleteLoading"
+                    @click="openBulkDeleteDialog"
+                    >{{ t("common.delete") }}</OButton
+                  >
+                </div>
+              </template>
+            </OTable>
+          </div>
+        </div>
+      </div>
+    </OPageLayout>
+    <template v-else-if="showAddAlertDialog && !showImportAlertDialog">
+      <AddAlert
+        v-model="formData"
+        :isUpdated="isUpdated"
+        :destinations="destinations"
+        :templates="templates"
+        :folderId="activeFolderId"
+        @update:list="refreshList"
+        @cancel:hideform="hideForm"
+        @refresh:destinations="refreshDestination"
+        @refresh:templates="getTemplates"
+      />
+    </template>
+    <template v-else>
+      <ImportAlert
+        :destinations="destinations"
+        :templates="templates"
+        :alerts="store?.state?.organizationData?.allAlertsListByFolderId[activeFolderId]"
+        :folderId="activeFolderId"
+        @update:alerts="refreshImportedAlerts"
+        @update:destinations="refreshDestination"
+        @update:templates="getTemplates"
+      />
+    </template>
+
+    <ConfirmDialog
+      :title="t('alerts.deleteAlertTitle')"
+      :message="t('alerts.deleteAlertMessage')"
+      @update:ok="deleteAlertByAlertId"
+      @update:cancel="confirmDelete = false"
+      v-model="confirmDelete"
+    />
+
+    <ConfirmDialog
+      :title="t('alerts.deleteAlertsTitle')"
+      :message="t('alerts.confirmDeleteAlerts', { count: selectedAlerts.length })"
+      @update:ok="bulkDeleteAlerts"
+      @update:cancel="confirmBulkDelete = false"
+      v-model="confirmBulkDelete"
+    />
+
+    <CompositeReferencesDrawer
+      v-if="referenceConflictCode"
+      :open="referenceDrawerOpen"
+      :show-trigger="false"
+      :references="referenceRows"
+      :hidden-reference-count="hiddenReferenceCount"
+      :conflict-code="referenceConflictCode"
+      @update:open="referenceDrawerOpen = $event"
+      @navigate="navigateToReference"
+    />
+
+    <template>
+      <ODialog
+        data-test="alert-list-form-dialog"
+        v-model:open="showForm"
+        persistent
+        size="sm"
+        :title="t('alerts.cloneTitle')"
+        :secondary-button-label="t('alerts.cancel')"
+        :primary-button-label="t('alerts.save')"
+        :primary-button-disabled="isSubmitting"
+        @click:secondary="showForm = false"
+        @click:primary="submitForm"
+      >
+        <div>
+          <OInput
+            data-test="to-be-clone-alert-name"
+            v-model="toBeCloneAlertName"
+            :label="t('alerts.alertName')"
+          />
+          <OSelect
+            data-test="to-be-clone-stream-type"
+            v-model="toBeClonestreamType"
+            :label="t('alerts.streamType')"
+            :options="streamTypes"
+            @update:model-value="updateStreams()"
+            class="mt-1"
+          />
+          <OSelect
+            data-test="to-be-clone-stream-name"
+            v-model="toBeClonestreamName"
+            :disabled="!toBeClonestreamType"
+            :label="t('alerts.stream_name')"
+            :options="indexOptions"
+            searchable
+            @update:model-value="updateStreamName"
+            class="mt-1 mb-2"
+          />
+          <div class="mb-4">
+            <SelectFolderDropDown
+              :type="'alerts'"
+              @folder-selected="updateFolderIdToBeCloned"
+              :activeFolderId="folderIdToBeCloned"
+            />
+          </div>
+        </div>
+      </ODialog>
+      <MoveAcrossFolders
+        v-model:open="showMoveAlertDialog"
+        :activeFolderId="activeFolderToMove"
+        :moduleId="selectedAlertToMove"
+        :anomalyConfigIds="selectedAnomalyConfigsToMove"
+        type="alerts"
+        @updated="updateAcrossFolders"
+        data-test="dashboard-move-to-another-folder-dialog"
+      />
+    </template>
+    <ExportResourceDialog
+      v-model:open="showExportDialog"
+      :items="alertsToExport"
+      :terraform="alertsTerraform"
+      :title="
+        t('alerts.exportDialogTitle', { count: alertsToExport.length }, alertsToExport.length)
+      "
+      :sub-title="t('alerts.exportDialogSubtitle')"
+      file-prefix="alerts"
+      data-test="alert-export-dialog"
+      @download="onExportDownloaded"
+    />
+  </div>
+</template>
+
+<script lang="ts">
+import {
+  defineComponent,
+  ref,
+  onBeforeMount,
+  onActivated,
+  onBeforeUnmount,
+  watch,
+  defineAsyncComponent,
+  onMounted,
+  computed,
+  reactive,
+} from "vue";
+import OPageLayout from "@/lib/core/PageLayout/OPageLayout.vue";
+import type { Ref } from "vue";
+import { useStore } from "vuex";
+import { useRouter } from "vue-router";
+import useStreams from "@/composables/useStreams";
+
+import { convertUnixToDateFormat as convertUnixToFormat } from "@/utils/date";
+import { raw, useI18nTyped, type I18nText } from "@/types/i18n";
+import { outcomeLabel, shouldShowRunOutcome } from "@/utils/alerts/runOutcome";
+import { debounce } from "lodash-es";
+import alertsService from "@/services/alerts";
+import {
+  isSloAlert,
+  isUnplaceableSloAlert,
+  sloAlertEditRoute,
+  sloDetailRoute,
+  sloIdOf,
+} from "@/utils/alerts/sloAlertRouting";
+import sloService from "@/services/slos";
+import destinationService from "@/services/alert_destination";
+import templateService from "@/services/alert_templates";
+import OEmptyState from "@/lib/core/EmptyState/OEmptyState.vue";
+import ConfirmDialog from "@/components/ConfirmDialog.vue";
+import segment from "@/services/segment_analytics";
+import config from "@/aws-exports";
+import ImportAlert from "@/components/alerts/ImportAlert.vue";
+import { getImageURL, getUUID, verifyOrganizationStatus } from "@/utils/zincutils";
+import { copyToClipboard } from "@/utils/clipboard";
+import { useReo } from "@/services/reodotdev_analytics";
+import type { Alert } from "@/ts/interfaces/index";
+import OIcon from "@/lib/core/Icon/OIcon.vue";
+import FolderList from "../common/sidebar/FolderList.vue";
+
+import MoveAcrossFolders from "../common/sidebar/MoveAcrossFolders.vue";
+import { invalidateDependencyGraphCache } from "@/composables/alerts/useDependencyGraph";
+import { nextTick } from "vue";
+import SelectFolderDropDown from "../common/sidebar/SelectFolderDropDown.vue";
+import OToggleGroup from "@/lib/core/ToggleGroup/OToggleGroup.vue";
+import OToggleGroupItem from "@/lib/core/ToggleGroup/OToggleGroupItem.vue";
+import OInput from "@/lib/forms/Input/OInput.vue";
+import OTooltip from "@/lib/overlay/Tooltip/OTooltip.vue";
+import OButton from "@/lib/core/Button/OButton.vue";
+import ODialog from "@/lib/overlay/Dialog/ODialog.vue";
+import ODropdown from "@/lib/overlay/Dropdown/ODropdown.vue";
+import ODropdownItem from "@/lib/overlay/Dropdown/ODropdownItem.vue";
+import ODropdownSeparator from "@/lib/overlay/Dropdown/ODropdownSeparator.vue";
+import OSpinner from "@/lib/feedback/Spinner/OSpinner.vue";
+import OSelect from "@/lib/forms/Select/OSelect.vue";
+import OTable from "@/lib/core/Table/OTable.vue";
+import OTimeCell from "@/lib/core/Table/cells/OTimeCell.vue";
+import OUserCell from "@/lib/core/Table/cells/OUserCell.vue";
+import OTag from "@/lib/core/Badge/OTag.vue";
+import OStatStrip from "@/lib/data/StatStrip/OStatStrip.vue";
+import IacRegistryLinks from "@/components/common/IacRegistryLinks.vue";
+import AlertSectionTabs from "@/components/alerts/AlertSectionTabs.vue";
+import CompositeReferencesDrawer from "@/components/alerts/composite/CompositeReferencesDrawer.vue";
+import ExportResourceDialog from "@/components/common/ExportResourceDialog.vue";
+import { alertsToTerraform } from "@/utils/alerts/alertTerraform";
+import type { CompositeAlertReference } from "@/ts/interfaces/alert";
+import type { StatItem } from "@/lib/data/StatStrip/OStatStrip.types";
+import type { IconName } from "@/lib/core/Icon/OIcon.icons";
+import type { OTableColumnDef } from "@/lib/core/Table/OTable.types";
+import { toast } from "@/lib/feedback/Toast/useToast";
+import { useShortcuts } from "@/lib/vue-shortcut-manager";
+import { focusSearchInput, isInputFocused } from "@/utils/keyboardShortcuts";
+import { COL } from "@/lib/core/Table/OTable.types";
+// import alertList from "./alerts";
+
+export default defineComponent({
+  name: "AlertList",
+  components: {
+    OPageLayout,
+    AddAlert: defineAsyncComponent(() => import("@/components/alerts/AddAlert.vue")),
+    OEmptyState,
+    ConfirmDialog,
+    ImportAlert,
+    FolderList,
+    MoveAcrossFolders,
+    OToggleGroup,
+    OToggleGroupItem,
+    OInput,
+    OTooltip,
+    SelectFolderDropDown,
+    OButton,
+    OIcon,
+    ODialog,
+    ODropdown,
+    ODropdownItem,
+    ODropdownSeparator,
+    OSpinner,
+    OSelect,
+    OTable,
+    OTimeCell,
+    OUserCell,
+    OTag,
+    OStatStrip,
+    CompositeReferencesDrawer,
+    ExportResourceDialog,
+    IacRegistryLinks,
+    AlertSectionTabs,
+  },
+  emits: ["update:changeRecordPerPage", "update:maxRecordToReturn"],
+  setup() {
+    const store = useStore();
+    const { t } = useI18nTyped();
+    const router = useRouter();
+    const { track } = useReo();
+    const formData: Ref<Alert | {}> = ref({});
+    const toBeClonedAlert: Ref<any> = ref({});
+    // Flag to skip clearing search state on the first folder emission after mount.
+    // When returning from add/edit screens, the FolderList emits the active folder
+    // which would normally clear restored search filters. This flag prevents that.
+    const savedAlertListFilters = store.state.alertListFilters || {};
+    const isRestoringState = ref(
+      !!savedAlertListFilters.searchQuery ||
+        !!savedAlertListFilters.filterQuery ||
+        !!savedAlertListFilters.searchAcrossFolders,
+    );
+    const showAddAlertDialog: any = ref(false);
+    const selectedDelete: any = ref(null);
+    const isUpdated: any = ref(false);
+    /**
+     * Render a multi-alert group count, marking it as a lower bound when the
+     * evaluation could not prove exactness (§5.4).
+     *
+     * The `≥` is not decoration: past the M-6 cap, or when the whole fetch page
+     * was still firing, the stored number is the most the evaluation could see,
+     * not the real total. Printing it bare would understate an incident.
+     */
+    const formatGroupCount = (count: number, isLowerBound?: boolean) =>
+      isLowerBound ? `≥${count}` : String(count);
+
+    const confirmDelete = ref<boolean>(false);
+    const splitterModel = ref(200);
+    const showForm = ref(false);
+    const indexOptions = ref([]);
+    const schemaList = ref([]);
+    const streams: any = ref({});
+    const isFetchingStreams = ref(false);
+    // Start in the loading state so the table shows the skeleton on first
+    // render instead of briefly flashing the empty state before the fetch.
+    const loading = ref(true);
+    const isSubmitting = ref(false);
+
+    // Compact toolbar: icon-only buttons when AI sidebar is open at narrow widths
+    const windowWidth = ref(window.innerWidth);
+    const onWindowResize = () => {
+      windowWidth.value = window.innerWidth;
+    };
+    const isCompactToolbar = computed(
+      () => store.state.isAiChatEnabled && windowWidth.value <= 1440,
+    );
+
+    const showImportAlertDialog = ref(false);
+    const showHistoryDrawer = ref(false);
+    const selectedHistoryAlertId = ref("");
+    const selectedHistoryAlertName = ref("");
+    const referenceDrawerOpen = ref(false);
+    const referenceAlertId = ref("");
+    const referenceRows = ref<CompositeAlertReference[]>([]);
+    const hiddenReferenceCount = ref(0);
+    const referenceConflictCode = ref<string | undefined>();
+
+    const navigateToReference = (reference: CompositeAlertReference) => {
+      referenceDrawerOpen.value = false;
+      router.push({
+        name: "alertDetail",
+        params: { alert_id: reference.alert_id },
+        query: {
+          org_identifier: store.state.selectedOrganization.identifier,
+          folder: reference.folder_id || "default",
+        },
+      });
+    };
+
+    const handleReferenceOpen = async (open: boolean, row: any) => {
+      referenceAlertId.value = row.alert_id;
+      referenceDrawerOpen.value = open;
+      referenceConflictCode.value = undefined;
+      hiddenReferenceCount.value = 0;
+      if (!open) return;
+      try {
+        const response = await alertsService.getCompositeReferences(
+          store.state.selectedOrganization.identifier,
+          row.alert_id,
+        );
+        referenceRows.value = response.data.references ?? [];
+      } catch {
+        referenceRows.value = [];
+      }
+    };
+
+    const openReferenceConflict = (failure: any) => {
+      referenceAlertId.value = failure.alert_id;
+      referenceRows.value = failure.references ?? [];
+      hiddenReferenceCount.value = failure.hidden_reference_count ?? 0;
+      referenceConflictCode.value = "child_referenced";
+      referenceDrawerOpen.value = true;
+    };
+
+    const { getStreams } = useStreams(t);
+
+    const toBeCloneAlertName = ref("");
+    const toBeClonedID = ref("");
+    const toBeClonedIsAnomaly = ref(false);
+    const toBeClonestreamType = ref("");
+    const toBeClonestreamName = ref("");
+    const streamTypes = ref(["logs", "metrics", "traces"]);
+    const streamNames: Ref<string[]> = ref([]);
+    const alertStateLoadingMap: Ref<{ [key: string]: boolean }> = ref({});
+    const folders = ref([
+      {
+        name: "folder1",
+      },
+      {
+        name: "folder2",
+      },
+    ]);
+    const activeFolderId = ref<any>(router.currentRoute.value.query.folder ?? "default");
+    const showMoveAlertDialog = ref(false);
+    // Clicking a row opens the alert's own status page. It replaced a side
+    // drawer: a multi-alert's per-group table, group history and cap banner
+    // do not fit a panel, and a routed page is linkable and back-navigable.
+    const triggerExpand = (row: any) => {
+      if (!row?.alert_id) return;
+      router.push({
+        name: "alertDetail",
+        params: { alert_id: row.alert_id },
+        query: {
+          org_identifier: store.state.selectedOrganization.identifier,
+          folder: row.folder_id || router.currentRoute.value.query.folder || "default",
+        },
+      });
+    };
+
+    onMounted(() => {
+      window.addEventListener("resize", onWindowResize);
+    });
+
+    onBeforeUnmount(() => {
+      window.removeEventListener("resize", onWindowResize);
+    });
+
+    // Show anomaly detection only when the backend is an enterprise or cloud build.
+    // The frontend build flag alone is not sufficient — an enterprise UI can be
+    // pointed at an OSS backend which does not have the feature.
+    // The backend can also disable it at runtime via O2_ANOMALY_DETECTION_DISABLED,
+    // surfaced as anomaly_detection_enabled in the config API response.
+    const isAnomalyDetectionEnabled = computed(
+      () =>
+        store.state.zoConfig.build_type !== "opensource" &&
+        config.isEnterprise === "true" &&
+        store.state.zoConfig.anomaly_detection_enabled === true,
+    );
+
+    // Initialize activeTab from URL query parameter, default to "all".
+    // Prevent forcing anomalyDetection tab when the feature is not available.
+    const rawTab = (router.currentRoute.value.query.tab as string) || "all";
+    const activeTab = ref(
+      rawTab === "anomalyDetection" && !isAnomalyDetectionEnabled.value ? "all" : rawTab,
+    );
+
+    const filteredResults: Ref<any[]> = ref([]);
+
+    // ── "Calm Signal" table helpers ─────────────────────────────────────────
+    // Recency of the last trigger, bucketed for the trigger-time dot + the
+    // recently-fired row highlight. Derived from the RAW microsecond timestamp
+    // (last_triggered_at_raw) so it stays correct regardless of display timezone.
+    const RECENT_TRIGGER_MS = 15 * 60 * 1000; // "hot" — fired in the last 15 min
+    const RECENT_TRIGGER_DAY_MS = 24 * 60 * 60 * 1000; // "warm" — within a day
+    const triggerAgeMs = (rawMicros: unknown): number | null => {
+      const n = Number(rawMicros);
+      if (!rawMicros || !Number.isFinite(n) || n <= 0) return null;
+      return Date.now() - n / 1000; // microseconds → milliseconds
+    };
+    const recencyLevel = (rawMicros: unknown): "hot" | "warm" | "cold" | "none" => {
+      const age = triggerAgeMs(rawMicros);
+      if (age === null) return "none";
+      if (age <= RECENT_TRIGGER_MS) return "hot";
+      if (age <= RECENT_TRIGGER_DAY_MS) return "warm";
+      return "cold";
+    };
+
+    // ── SLO alerts in this list (Feature 5, Phase 2) ────────────────────────
+    // An SLO alert watches no stream and runs no query, so without this branch
+    // its row says nothing at all about what it is for. It names its SLO
+    // instead, and links there — which is also where it is edited (D1).
+
+    const isSloRow = (row: any): boolean => isSloAlert(row);
+
+    /** id -> name for every SLO in the org. `list_slos` is unpaginated and
+     *  folder-agnostic when asked without a folder, so ONE call resolves every
+     *  row — an alert may well sit in a different folder from its SLO. */
+    const sloNamesById = ref<Record<string, string>>({});
+    // Two flags, not one: the row set is reassigned on every folder switch,
+    // cache hit and refresh, so a SUCCESSFUL lookup must not repeat — but a
+    // FAILED one must, or a single transient 5xx leaves every SLO row showing a
+    // raw KSUID for the rest of the visit, with Refresh unable to fix it.
+    let sloNamesInFlight = false;
+    let sloNamesLoaded = false;
+
+    const ensureSloNames = (rows: any[]): void => {
+      if (sloNamesInFlight || sloNamesLoaded) return;
+      if (!rows?.some((row: any) => isSloRow(row))) return;
+      // The org can legitimately be unset on the very first tick; throwing here
+      // would surface as an unhandled error inside a watcher, from a lookup
+      // nobody asked for.
+      const org = store.state.selectedOrganization?.identifier;
+      if (!org) return;
+      sloNamesInFlight = true;
+      sloService
+        .list(org)
+        .then((res: any) => {
+          const names: Record<string, string> = {};
+          for (const slo of res?.data?.list ?? []) {
+            if (slo?.id && slo?.name) names[slo.id] = slo.name;
+          }
+          sloNamesById.value = names;
+          sloNamesLoaded = true;
+        })
+        .catch(() => {
+          // Swallowed, and deliberately NOT marked loaded: an unresolved name
+          // degrades to the raw id, which still answers "which SLO?", and the
+          // next refresh gets to try again. A toast here would fire on a page
+          // the user did not ask anything of.
+        })
+        .finally(() => {
+          sloNamesInFlight = false;
+        });
+    };
+
+    /** Never blank. The name if known, else the raw id — the only thing that
+     *  makes an unresolvable row diagnosable. */
+    const sloLabel = (row: any): string => sloNamesById.value[row?.slo_id] || row?.slo_id || "--";
+
+    const goToSlo = (row: any) => {
+      if (!row?.slo_id) return;
+      router.push(sloDetailRoute(row.slo_id, store.state.selectedOrganization?.identifier));
+    };
+
+    // ── Alert operational state (single source of truth) ────────────────────
+    // failed  → an anomaly whose model training failed (needs attention)
+    // active  → enabled and running
+    // paused  → disabled
+    const alertState = (row: any): "active" | "paused" | "failed" => {
+      if (row?.is_real_time === "anomaly" && String(row?.status).toLowerCase() === "failed")
+        return "failed";
+      return row?.enabled ? "active" : "paused";
+    };
+
+    // ── Last run outcome (Part IV) ─────────────────────────────────────────
+    // A disabled alert freezes its last outcome, so the badge is suppressed
+    // unless the alert is actually running — otherwise a paused alert would
+    // advertise "Firing" indefinitely.
+    const showRunOutcome = (row: any): boolean =>
+      shouldShowRunOutcome(row?.enabled, row?.last_outcome);
+
+    // Never present the outcome as live state: it is the result of the LAST
+    // evaluation, so it is always qualified with when that ran.
+    const runOutcomeTooltip = (row: any) => {
+      const at = row?.last_outcome_at ? convertUnixToDateFormat(row.last_outcome_at) : null;
+      // Pass every label: outcomeLabel's own defaults are English.
+      const label = outcomeLabel(
+        row?.last_outcome,
+        t("alerts.historyTimeline.firing"),
+        t("alerts.historyTimeline.ok"),
+        t("alerts.historyTimeline.error"),
+        t("alerts.historyTimeline.skipped"),
+        t("alerts.historyTimeline.unknown"),
+        t("alerts.historyTimeline.pending"),
+      );
+      return raw(at ? `${label} ${t("alerts.asOf")} ${at}` : label);
+    };
+
+    // Full-row highlight — only the EXCEPTIONS get a wash, so attention goes to
+    // what's off, not what's fine: failed=light red, paused=muted grey, active
+    // stays clean (its state still reads from the green left rail).
+    const alertRowClass = (row: any): string => {
+      const s = alertState(row);
+      return s === "failed" ? "!bg-status-error-bg" : s === "paused" ? "!bg-surface-panel" : "";
+    };
+
+    // Extreme-left state rail — a full-height colour bar at the very start of the
+    // row (inset box-shadow so it paints regardless of border-collapse). rem width
+    // + token colour keep it theme-aware and hardcode-free.
+    const alertRowStyle = (row: any): Record<string, string> => {
+      const s = alertState(row);
+      const color =
+        s === "failed"
+          ? "var(--color-error-500)"
+          : s === "paused"
+            ? "var(--color-grey-400)"
+            : "var(--color-success-500)";
+      return { boxShadow: `var(--shadow-rail-geom) ${color}` };
+    };
+
+    // Type chip (the "left chip"): glyph + colour by alert type.
+    const typeIconName = (row: any): IconName =>
+      isSloRow(row)
+        ? "track-changes"
+        : row?.alert_type === "Composite"
+          ? "account-tree"
+          : row?.is_real_time === "anomaly"
+            ? "query-stats"
+            : row?.is_real_time
+              ? "bolt"
+              : "schedule";
+    const typeIconClass = (row: any): string =>
+      // Deliberately the neutral tone, not a status colour: green here reads as
+      // "healthy" on a row whose actual state lives two columns to the right.
+      // The glyph and the badge carry the family; colour carries state.
+      isSloRow(row)
+        ? "text-text-secondary"
+        : row?.alert_type === "Composite"
+          ? "text-status-warning-text"
+          : row?.is_real_time === "anomaly"
+            ? "text-status-info-text"
+            : row?.is_real_time
+              ? "text-status-warning-text"
+              : "text-text-secondary";
+
+    // At-a-glance operational counts for the summary strip. Counts over the rows
+    // currently shown (folder + tab + search) so it tracks what the user sees.
+    const stateCounts = computed(() => {
+      const rows = filteredResults.value || [];
+      let active = 0;
+      let paused = 0;
+      let failed = 0;
+      let recent = 0;
+      for (const r of rows) {
+        // active = unpaused (enabled); paused = disabled. These two partition the
+        // rows. `failed` is an orthogonal health overlay (a failed anomaly is still
+        // active), so it is counted separately and may overlap with active/paused.
+        if (r.enabled) active += 1;
+        else paused += 1;
+        if (r.is_real_time === "anomaly" && String(r.status).toLowerCase() === "failed")
+          failed += 1;
+        if (recencyLevel(r.last_triggered_at_raw) === "hot") recent += 1;
+      }
+      return { active, paused, failed, recent, total: rows.length };
+    });
+
+    // Stat tiles for the summary strip. `tone` is the single source of colour so
+    // states stay consistent with the row-level State pills. When the folder is
+    // empty (no data at all) every tile shows a muted "—"; once there IS data,
+    // real counts show — including a legitimate "0". The `max` gives each state
+    // tile a proportion bar (its share of the total).
+    const summaryStats = computed<StatItem[]>(() => {
+      const c = stateCounts.value;
+      const hasData = c.total > 0;
+      const v = (n: number): string | number => (hasData ? n : "—");
+      const share = hasData ? c.total : undefined;
+      // Severity-descending so what needs attention sits on the left (matches the
+      // Incidents / Eval Jobs strips): failed (error) → recent (warning) → active
+      // (healthy) → paused (inert) → Total last.
+      return [
+        {
+          key: "failed",
+          label: t("alerts.summaryFailed"),
+          value: v(c.failed),
+          icon: "error-outline",
+          tone: "error",
+          max: share,
+          dataTest: "alert-summary-failed",
+        },
+        {
+          key: "recent",
+          label: t("alerts.summaryRecent"),
+          value: v(c.recent),
+          icon: "bolt",
+          tone: "warning",
+          max: share,
+          dataTest: "alert-summary-recent",
+        },
+        {
+          key: "active",
+          label: t("alerts.summaryActive"),
+          value: v(c.active),
+          icon: "check-circle",
+          tone: "success",
+          max: share,
+          dataTest: "alert-summary-active",
+        },
+        {
+          key: "paused",
+          label: t("alerts.summaryPaused"),
+          value: v(c.paused),
+          icon: "pause",
+          tone: "neutral",
+          max: share,
+          dataTest: "alert-summary-paused",
+        },
+        {
+          key: "total",
+          label: t("alerts.summaryTotal"),
+          value: v(c.total),
+          icon: "format-list-bulleted",
+          tone: "primary",
+          // Total is clickable (clears the filter) but never shows the ring — the
+          // selected key is only ever a real state, never "total". No bar (its
+          // share of itself is always 100%).
+          dataTest: "alert-summary-total",
+        },
+      ];
+    });
+
+    // ── Stat-tile quick filter ──────────────────────────────────────────────
+    // Clicking a summary tile filters the table to that state (toggle); the
+    // "total" tile clears it. Counts on the tiles stay full (from filteredResults)
+    // so you always see the folder totals; only the table rows are filtered.
+    const stateFilter = ref<"active" | "paused" | "failed" | "recent" | null>(null);
+    const displayedAlerts = computed(() => {
+      const rows = filteredResults.value || [];
+      const f = stateFilter.value;
+      if (!f) return rows;
+      if (f === "recent")
+        return rows.filter((r: any) => recencyLevel(r.last_triggered_at_raw) === "hot");
+      if (f === "failed")
+        return rows.filter(
+          (r: any) => r.is_real_time === "anomaly" && String(r.status).toLowerCase() === "failed",
+        );
+      // active = unpaused (enabled); paused = disabled — matching the summary
+      // counts. A failed anomaly is still active here (failed is an overlay).
+      return rows.filter((r: any) => (f === "active" ? r.enabled : !r.enabled));
+    });
+    const onStatSelect = (key: string) => {
+      if (key === "total") {
+        stateFilter.value = null;
+        return;
+      }
+      stateFilter.value =
+        stateFilter.value === key ? null : (key as "active" | "paused" | "failed" | "recent");
+    };
+
+    const activeFolderToMove = ref("default");
+
+    // Tabs for alerts view
+    const alertTabs = computed(() => {
+      const tabs: { label: I18nText; value: string; icon?: IconName }[] = [
+        { label: t("alerts.all"), value: "all", icon: "format-list-bulleted" },
+        { label: t("alerts.scheduled"), value: "scheduled", icon: "schedule" },
+        { label: t("alerts.realTime"), value: "realTime", icon: "bolt" },
+        { label: t("alerts.compositeAlert"), value: "composite", icon: "account-tree" },
+      ];
+      if (isAnomalyDetectionEnabled.value) {
+        tabs.push({
+          label: t("alerts.anomalyDetection"),
+          value: "anomalyDetection",
+          icon: "query-stats",
+        });
+      }
+      return tabs;
+    });
+
+    // Keep old tabs for backward compatibility if needed
+    const tabs = reactive([
+      {
+        label: t("alerts.all"),
+        value: "all",
+      },
+      {
+        label: t("alerts.scheduled"),
+        value: "scheduled",
+      },
+      {
+        label: t("alerts.realTime"),
+        value: "realTime",
+      },
+      {
+        label: t("alerts.compositeAlert"),
+        value: "composite",
+      },
+    ]);
+
+    const columns = computed<OTableColumnDef[]>(() => {
+      const baseColumns: OTableColumnDef[] = [
+        {
+          id: "name",
+          accessorKey: "name",
+          header: t("alerts.name"),
+          sortable: true,
+          hideable: true,
+          size: 280,
+          minSize: 320,
+          // Flex: fills the leftover width on load, freezes on first resize.
+          meta: { align: "left", flex: true },
+        },
+        // "last_outcome" — did the most recent evaluation fire? Distinct from
+        // "state" (is it running?) and from the anomaly-only "status" (is the
+        // model trained?). Backed by the alert_states rollup row.
+        {
+          id: "last_outcome",
+          accessorKey: "last_outcome",
+          header: t("alerts.lastOutcome"),
+          cell: " ",
+          sortable: true,
+          resizable: true,
+          hideable: true,
+          size: COL.status,
+          minSize: 130,
+          meta: { align: "left" },
+        },
+        // "priority" — how much humans care (Feature 2, PT-3). A different
+        // axis from "last_outcome" (did it fire): a P1 alert whose last run was
+        // normal is perfectly ordinary.
+        {
+          id: "priority",
+          accessorKey: "priority",
+          header: t("alerts.priority"),
+          cell: " ",
+          sortable: true,
+          resizable: true,
+          hideable: true,
+          size: COL.status,
+          meta: { align: "left" },
+        },
+        // "groups" — multi-alert fan-out summary (alerts_2.md §5.4). Blank for
+        // every alert that has not opted in to per-group evaluation. Not
+        // sortable: the value is a composite of two counts plus their
+        // exactness, so a single sort order would misrepresent it.
+        {
+          id: "groups",
+          accessorKey: "groups_observed",
+          header: t("alerts.groups.tab"),
+          cell: " ",
+          sortable: false,
+          resizable: true,
+          hideable: true,
+          size: 170,
+          meta: { align: "left" },
+        },
+        // "tags" — the selection primitive (PT-6). Not sortable: a tag list has
+        // no meaningful order and sorting by it would imply one.
+        {
+          id: "tags",
+          accessorKey: "tags",
+          header: t("alerts.tags"),
+          cell: " ",
+          sortable: false,
+          resizable: true,
+          hideable: true,
+          size: 200,
+          meta: { align: "left" },
+        },
+        {
+          id: "owner",
+          accessorKey: "owner",
+          header: t("alerts.owner"),
+          cell: " ",
+          sortable: true,
+          resizable: true,
+          hideable: true,
+          size: COL.owner,
+          meta: { align: "left" },
+        },
+        // "frequency" — the "Check every" cadence, meaningless for real-time alerts
+        ...(activeTab.value !== "realTime"
+          ? [
+              {
+                id: "frequency",
+                accessorKey: "frequency",
+                header: t("alerts.frequency"),
+                cell: " ",
+                sortable: true,
+                resizable: true,
+                hideable: true,
+                size: COL.frequency,
+                meta: { align: "left" },
+              } as OTableColumnDef,
+            ]
+          : []),
+        {
+          id: "last_triggered_at",
+          accessorKey: "last_triggered_at",
+          header: t("alerts.lastTriggered"),
+          cell: " ",
+          sortable: true,
+          resizable: true,
+          hideable: true,
+          size: COL.dateAbsolute,
+          meta: { align: "left" },
+        },
+        {
+          id: "last_satisfied_at",
+          accessorKey: "last_satisfied_at",
+          header: t("alerts.lastSatisfied"),
+          cell: " ",
+          sortable: true,
+          resizable: true,
+          hideable: true,
+          size: COL.dateAbsolute,
+          meta: { align: "left" },
+        },
+        // Anomaly Detection columns — shown on anomalyDetection and all tabs
+        ...(activeTab.value === "anomalyDetection" || activeTab.value === "all"
+          ? [
+              {
+                id: "status",
+                accessorKey: "status",
+                header: t("alerts.status"),
+                cell: " ",
+                sortable: true,
+                resizable: true,
+                hideable: true,
+                size: COL.status,
+                meta: { align: "left" },
+              } as OTableColumnDef,
+            ]
+          : []),
+        {
+          id: "actions",
+          header: t("alerts.actions"),
+          isAction: true,
+          sortable: false,
+          size: 160,
+          meta: { align: "center", cellClass: "actions-column", actionCount: 4 },
+        },
+      ];
+
+      // insert folder_name column after the name column if applicable
+      if (searchAcrossFolders.value && searchQuery.value !== "") {
+        baseColumns.splice(1, 0, {
+          id: "folder_name",
+          accessorKey: "folder_name",
+          header: t("alerts.folder"),
+          cell: " ",
+          sortable: true,
+          resizable: true,
+          hideable: true,
+          size: COL.folder,
+          meta: { align: "left" },
+        } as OTableColumnDef);
+      }
+
+      return baseColumns;
+    });
+
+    const destinations = ref([0]);
+    const templates = ref([0]);
+    const selectedAlertIds = ref<string[]>([]);
+    const selectedAlerts = computed({
+      get: () =>
+        filteredResults.value.filter(
+          (row: any) => selectedAlertIds.value.includes(row.alert_id) || row.selected === true,
+        ),
+      set: (val) => {
+        if (val.length === 0) {
+          selectedAlertIds.value = [];
+          filteredResults.value.forEach((row: any) => {
+            row.selected = false;
+          });
+        }
+      },
+    });
+    const allSelectedAlerts = ref(false);
+    const allAlerts: Ref<any[]> = ref([]);
+
+    // Watched rather than called from `getAlertsFn`: a folder revisit is served
+    // from `allAlertsListByFolderId` by `getAlertsByFolderId`, which never
+    // reaches the fetch path — so names wired only into the fetch would go
+    // missing on exactly the second visit to a folder.
+    watch(allAlerts, (rows) => ensureSloNames(rows as any[]), {
+      immediate: true,
+    });
+
+    const searchQuery = ref<any>(savedAlertListFilters.searchQuery || "");
+    const filterQuery = ref<any>(savedAlertListFilters.filterQuery || "");
+    const searchAcrossFolders = ref<any>(savedAlertListFilters.searchAcrossFolders || false);
+    const selectedAlertToMove: Ref<any[]> = ref([]);
+    const selectedAnomalyConfigsToMove: Ref<any[]> = ref([]);
+    const folderIdToBeCloned = ref<any>(router.currentRoute.value.query.folder ?? "default");
+    // ---------------------------------------------------------------------------
+    // Anomaly detection scaffolding — TEMPORARY until backend returns anomaly
+    // data as part of the alert list API. Remove this block when that happens.
+    // ---------------------------------------------------------------------------
+    // Normalizes an anomaly-detection item returned by the merged alerts list API
+    // (alert_type === "anomaly_detection") into the standard alert row shape.
+    const normalizeAnomalyToAlertRow = (anomaly: any, _num?: number): any => ({
+      alert_id: anomaly.alert_id || anomaly.anomaly_id || anomaly.id,
+      anomaly_id: anomaly.alert_id || anomaly.anomaly_id || anomaly.id,
+      name: anomaly.name,
+      alert_type: "anomaly_detection",
+      stream_name: anomaly.stream_name || "--",
+      stream_type: anomaly.stream_type || "--",
+      enabled: anomaly.enabled,
+      conditions: "--",
+      rawCondition: {},
+      detection_function: anomaly.detection_function || "",
+      query_mode: anomaly.query_mode || "filters",
+      custom_sql: anomaly.custom_sql || "",
+      filters: anomaly.filters || [],
+      histogram_interval: anomaly.histogram_interval || "",
+      description: anomaly.description || "",
+      uuid: getUUID(),
+      owner: anomaly.owner || "",
+      period: anomaly.trigger_condition?.period ?? "",
+      frequency: anomaly.trigger_condition?.frequency ?? "",
+      frequency_type: anomaly.trigger_condition?.frequency_type ?? "minutes",
+      last_triggered_at: anomaly.last_triggered_at
+        ? convertUnixToDateFormat(anomaly.last_triggered_at)
+        : "",
+      // Raw microsecond epoch — drives the relative-time cell, recency dot and
+      // recently-fired row highlight (timezone-independent).
+      last_triggered_at_raw: anomaly.last_triggered_at ?? null,
+      last_satisfied_at: anomaly.last_satisfied_at
+        ? convertUnixToDateFormat(anomaly.last_satisfied_at)
+        : "",
+      detection_window: (() => {
+        const mins = anomaly.trigger_condition?.period_minutes;
+        if (!mins) return "--";
+        if (mins >= 60) {
+          const h = Math.floor(mins / 60);
+          const m = mins % 60;
+          return m === 0 ? `${h} Hours` : `${h} Hours ${m} Mins`;
+        }
+        return `${mins} mins`;
+      })(),
+      last_trained_at: anomaly.last_trained_at
+        ? convertUnixToDateFormat(anomaly.last_trained_at)
+        : "",
+      total_evaluations: anomaly.total_evaluations ?? "--",
+      firing_count: anomaly.firing_count ?? "--",
+      status: anomaly.status || "--",
+      last_error: anomaly.last_error || null,
+      // Built field by field: anything unlisted is invisible to the table.
+      last_outcome: anomaly.last_outcome ?? null,
+      last_outcome_at: anomaly.last_outcome_at ?? null,
+      priority: anomaly.priority ?? null,
+      tags: anomaly.tags ?? [],
+      selected: false,
+      type: "anomaly",
+      folder_name: {
+        name: anomaly.folder_name || "default",
+        id: anomaly.folder_id || "",
+      },
+      // Marker: "anomaly" distinguishes these rows from boolean is_real_time alerts
+      is_real_time: "anomaly",
+    });
+
+    // ---------------------------------------------------------------------------
+
+    const getAlertsByFolderId = async (store: any, folderId: any) => {
+      //this is the condition where we are fetching the alerts from the server
+      // assigning it to the allAlertsListByFolderId in the store
+      if (!store.state.organizationData.allAlertsListByFolderId[folderId]) {
+        await getAlertsFn(store, folderId);
+      } else {
+        //this is the condition where we are assigning the alerts to the filteredResults so whenever
+        // we are not fetching the alerts again, we are just assigning the alerts to the filteredResults
+        allAlerts.value = store.state.organizationData.allAlertsListByFolderId[folderId];
+        // Data is served synchronously from cache — clear the loading flag
+        // (it starts true to avoid the empty-state flash) so the table renders
+        // the cached rows instead of staying stuck on the skeleton.
+        loading.value = false;
+      }
+    };
+    const getAlertsFn = async (
+      store: any,
+      folderId: any,
+      query = "",
+      refreshResults = true,
+      alertType = "",
+    ) => {
+      //why refreshResults flag is used
+      // this is the only used for one edge case when we move alerts from one folder to another folder
+      //we forcing the destination and source folder to fetch the alerts again
+      //so what happens is that if destination folder takes time to fetch the alerts by the time source folder finishes it call
+      //and assign the alerts and the after that destination folder will resovle and override the source folder alerts
+      //so to avoid this we are using the refreshResults flag
+      //if the flag is false then we are not assigning the alerts to the filteredResults
+      //and if the flag is true then we are assigning the alerts to the filteredResults
+      //and also we are not filtering the alerts by the activeTab if the flag is false because we dont need to show the alerts in the table
+      //for a moment also so we are not filtering the alerts by the activeTab
+      selectedAlerts.value = [];
+      allSelectedAlerts.value = false;
+      // The alerts list is refreshed after every alert mutation — drop the shared
+      // dependency-graph cache so the destination/template impact dialogs reflect
+      // the change on next open.
+      invalidateDependencyGraphCache();
+      if (query) {
+        //here we reset the filteredResults before fetching the filtered alerts
+        filteredResults.value = [];
+      }
+      const dismiss = toast({
+        variant: "loading",
+        message: t("toastMessages.alerts.pleaseWaitWhileLoadingAlerts"),
+        timeout: 0,
+      });
+      if (query) {
+        folderId = "";
+      }
+      loading.value = true;
+      try {
+        const res = await alertsService.listByFolderId(
+          1,
+          1000,
+          "name",
+          false,
+          "",
+          store?.state?.selectedOrganization?.identifier,
+          folderId,
+          query,
+          alertType,
+        );
+        var counter = 1;
+        let localAllAlerts = [];
+        //this is the alerts that we use to store
+        localAllAlerts = res.data.list.map((alert: any) => {
+          return {
+            ...alert,
+            uuid: getUUID(),
+          };
+        });
+
+        //general alerts that we use to display (formatting the alerts into the table format)
+        //localAllAlerts is the alerts that we use to store
+        // PERFORMANCE OPTIMIZATION: Store raw condition data without conversion
+        // Conversion happens lazily only when user expands an alert (in triggerExpand)
+        // Anomaly detection items (alert_type === "anomaly_detection") are handled by
+        // normalizeAnomalyToAlertRow which reads period/frequency from trigger_condition.
+        localAllAlerts = localAllAlerts.map((data: any) => {
+          if (data.alert_type === "anomaly_detection") {
+            const num = counter++;
+            return normalizeAnomalyToAlertRow(data, num);
+          }
+
+          if (data.alert_type === "composite") {
+            return {
+              ...data,
+              alert_id: data.alert_id || data.id,
+              alert_type: "Composite",
+              stream_name: "--",
+              stream_type: "",
+              conditions: data.expression_summary || data.composite_condition?.expression || "--",
+              rawCondition: null,
+              period: "",
+              frequency: "",
+              status: "--",
+              child_count: data.child_count ?? data.children?.length ?? 0,
+              referenced_by_composite_count: data.referenced_by_composite_count ?? 0,
+              uuid: data.uuid,
+              selected: false,
+              type: "composite",
+              folder_name: {
+                name: data.folder_name,
+                id: data.folder_id,
+              },
+              is_real_time: "composite",
+              last_triggered_at: convertUnixToDateFormat(data.last_triggered_at),
+              last_triggered_at_raw: data.last_triggered_at ?? null,
+              last_satisfied_at: convertUnixToDateFormat(data.last_satisfied_at),
+            };
+          }
+
+          let frequency = "";
+          if (data.trigger_condition?.frequency_type == "cron") {
+            frequency = data.trigger_condition.cron;
+          } else {
+            frequency = data.trigger_condition.frequency;
+          }
+
+          return {
+            alert_id: data.alert_id,
+            name: data.name,
+            alert_type: data.is_real_time ? "Real Time" : "Scheduled",
+            stream_name: data.stream_name ? data.stream_name : "--",
+            stream_type: data.stream_type,
+            enabled: data.enabled,
+            conditions: "--", // Placeholder - will be converted on-demand in triggerExpand
+            rawCondition: data.condition, // Store raw condition for lazy conversion
+            description: data.description,
+            uuid: data.uuid,
+            owner: data.owner,
+            period: data.is_real_time ? "" : data?.trigger_condition?.period,
+            frequency: data.is_real_time ? "" : frequency,
+            frequency_type: data?.trigger_condition?.frequency_type,
+            last_triggered_at: convertUnixToDateFormat(data.last_triggered_at),
+            // Raw microsecond epoch — drives the relative-time cell, recency dot
+            // and recently-fired row highlight (timezone-independent).
+            last_triggered_at_raw: data.last_triggered_at ?? null,
+            last_satisfied_at: convertUnixToDateFormat(data.last_satisfied_at),
+            last_trained_at: "",
+            status: "--",
+            // Durable run state from the alert_states rollup row (Part IV).
+            // This is the LAST RUN outcome, not a live firing flag — always
+            // paired with last_outcome_at so the UI can say "as of <time>".
+            last_outcome: data.last_outcome ?? null,
+            // Configured priority & tags (Feature 2). Must be carried
+            // explicitly: this mapping builds the row object field by field,
+            // so anything not listed here is invisible to the table no matter
+            // what the API returns.
+            priority: data.priority ?? null,
+            tags: data.tags ?? [],
+            // Severity axis (alerts_2.md Feature 1) — independent of outcome.
+            level: data.level ?? null,
+            level_since: data.level_since ?? null,
+            // Whether the alert CURRENTLY evaluates per group — either the
+            // aggregation opt-in or the PromQL per-series one. The counts
+            // below survive an opt-out (§5.3 leaves the rollup row alone), so
+            // without this flag a simple alert would keep advertising the
+            // group summary from back when it was a multi-alert.
+            multi_alert:
+              data.condition?.type === "promql"
+                ? !!data.condition?.promql_multi_alert
+                : !!data.condition?.aggregation?.multi_alert,
+            // Multi-alert fan-out counts (§5.4). `undefined` — not 0 — for an
+            // alert that never opted in, so the cell can render "—" rather
+            // than claiming it observed zero groups.
+            groups_observed: data.groups_observed,
+            groups_firing: data.groups_firing,
+            groups_observed_is_lower_bound: data.groups_observed_is_lower_bound,
+            groups_firing_is_lower_bound: data.groups_firing_is_lower_bound,
+            last_outcome_at: data.last_outcome_at ?? null,
+            last_outcome_since: data.last_outcome_since ?? null,
+            selected: false,
+            type: data.condition.type,
+            // The SLO this alert belongs to (Feature 5, Phase 2). Read from the
+            // RAW api row — `condition` — because the mapped row below has no
+            // such key; it keeps only the flattened `type` and `rawCondition`.
+            // Empty string, not undefined, for an SLO alert whose stored
+            // condition is NULL: the row is still an SLO alert (`type`), it
+            // just has nowhere to link.
+            slo_id: isSloAlert(data) ? (sloIdOf(data) ?? "") : "",
+            folder_name: {
+              name: data.folder_name,
+              id: data.folder_id,
+            },
+            is_real_time: data.is_real_time,
+          };
+        });
+
+        //this is the condition where we are setting the alertStateLoadingMap
+        localAllAlerts.forEach((alert: any) => {
+          alertStateLoadingMap.value[alert.uuid as string] = false;
+        });
+        //this is the condition where we are setting the allAlertsListByFolderId in the store
+        store?.dispatch("setAllAlertsListByFolderId", {
+          ...store.state.organizationData.allAlertsListByFolderId,
+          [folderId]: localAllAlerts,
+        });
+        //RACE CONDITION handling
+        //this is the condition where we are checking the if the folderId is not equal to the activeFolderId
+        //if it is not equal then we are returning  and if is not search across folders then we are returning as well as in previous step we are anyways storing in the store for future use
+        //this will prevent the side effects of allAlerts are overriding the actual alerts if users are rapidly moving from one folder to another folder
+        if (folderId != activeFolderId.value && !query) {
+          dismiss();
+          return;
+        }
+        //here we are actually assigning the localAllAlerts to the allAlerts to avoid the side effects of allAlerts are overriding the actual alerts if users are rapidly moving from one folder to another folder
+        allAlerts.value = localAllAlerts;
+        //this is the condition where we are setting the filteredResults
+        //1. If it is search across folders then also we are setting the filteredResults(which contains the filtered alerts)
+        //2. If it is not search across folders then we are setting the filteredResults to the alerts(which contains all the alerts)
+        //here we are setting the filteredResults to the alerts
+        if (refreshResults) {
+          filteredResults.value = allAlerts.value;
+        }
+
+        if (!router.currentRoute.value.query.action) {
+          showAddAlertDialog.value = false;
+          showImportAlertDialog.value = false;
+        }
+
+        //here we are filtering the alerts by the activeTab
+        //why we are passing the refreshResults flag as false because we dont need to show the alerts in the table
+        filterAlertsByTab(refreshResults);
+        if (router.currentRoute.value.query.action == "import") {
+          showImportAlertDialog.value = true;
+        }
+        if (router.currentRoute.value.query.action == "add") {
+          showAddUpdateFn({ row: undefined });
+        }
+        if (router.currentRoute.value.query.action == "update") {
+          const alertId = router.currentRoute.value.query.alert_id as string;
+          const alert = await getAlertById(alertId);
+
+          // Same diversion as the edit button. This path is reached by a hard
+          // reload, a bookmark or the back button, so guarding only the button
+          // would leave the generic editor reachable for an SLO alert.
+          if (!(await divertSloAlert(alert))) {
+            showAddUpdateFn({
+              row: alert,
+            });
+          }
+        }
+        dismiss();
+      } catch (error) {
+        console.error(error);
+        dismiss();
+        toast({
+          variant: "error",
+          message: t("toastMessages.alerts.errorWhilePullingAlerts"),
+        });
+      } finally {
+        loading.value = false;
+      }
+    };
+    /** Send an SLO alert to its SLO page instead of the generic editor.
+     *  Returns true when it handled the alert and the caller must stop. */
+    const divertSloAlert = async (alert: any): Promise<boolean> => {
+      const sloRoute = sloAlertEditRoute(alert, store.state.selectedOrganization.identifier);
+      if (sloRoute) {
+        await router.push(sloRoute);
+        return true;
+      }
+      if (isUnplaceableSloAlert(alert)) {
+        toast({ variant: "error", message: t("alerts.sloAlertUnplaceable") });
+        // Refusing is not enough: this path is reached FROM the URL, so leaving
+        // `?action=update&alert_id=<bad>` behind makes the refusal permanent.
+        // The editor is opened by a watcher on `query.action` alone, so the
+        // next edit of an ordinary alert pushes `action=update` again, the
+        // watched value never changes, and the form silently never opens.
+        //
+        // Swallowed: both call sites sit inside a try/catch that reports
+        // "Error while pulling alerts" / "Failed to load alert for editing".
+        // A tidy-up of the URL failing must not be reported as either — the
+        // alert has already been refused, correctly, and the toast is out.
+        // `name` goes too: it is written alongside `action`/`alert_id` when the
+        // editor is opened and is read by nothing, so leaving it behind is just
+        // a stale alert name sitting in the URL of a refused edit.
+        const {
+          action: _action,
+          alert_id: _alertId,
+          name: _name,
+          ...rest
+        } = router.currentRoute.value.query;
+        await router.replace({ name: "alertList", query: rest }).catch(() => {});
+        return true;
+      }
+      return false;
+    };
+
+    const getAlertById = async (id: string) => {
+      const dismiss = toast({
+        variant: "loading",
+        message: t("toastMessages.alerts.pleaseWaitWhileLoadingAlert"),
+        timeout: 0,
+      });
+      try {
+        const res = await alertsService.get_by_alert_id(
+          store.state.selectedOrganization.identifier,
+          id,
+        );
+        dismiss();
+        return res.data;
+      } catch (error) {
+        dismiss();
+        throw error;
+      }
+    };
+    onBeforeMount(async () => {
+      await getTemplates();
+      getDestinations();
+    });
+    onActivated(() => getDestinations());
+
+    // Define filterAlertsByTab before watchers that use it
+    const filterAlertsByTab = (refreshResults: boolean = true) => {
+      if (!refreshResults) {
+        return;
+      }
+      // When incidents tab is active, skip filtering (IncidentList handles its own data)
+      if (activeTab.value === "incidents") {
+        return;
+      }
+      if (activeTab.value === "scheduled") {
+        // Scheduled: is_real_time is falsy (false / undefined / null) — anomaly rows ("anomaly") excluded
+        filteredResults.value = allAlerts.value.filter(
+          (alert: any) => !alert.is_real_time && alert.alert_type !== "Composite",
+        );
+      } else if (activeTab.value === "realTime") {
+        // Real-time: strictly boolean true — anomaly rows excluded
+        filteredResults.value = allAlerts.value.filter((alert: any) => alert.is_real_time === true);
+      } else if (activeTab.value === "anomalyDetection") {
+        // Anomaly Detection: rows injected by normalizeAnomalyToAlertRow with is_real_time === "anomaly"
+        filteredResults.value = allAlerts.value.filter(
+          (alert: any) => alert.is_real_time === "anomaly",
+        );
+      } else if (activeTab.value === "composite") {
+        filteredResults.value = allAlerts.value.filter(
+          (alert: any) => alert.alert_type === "Composite",
+        );
+      } else {
+        // "all" — show everything
+        filteredResults.value = allAlerts.value;
+      }
+    };
+
+    const onAlertTabChange = async (tab: string) => {
+      activeTab.value = tab;
+      const apiType =
+        tab === "realTime" ? "realtime" : tab === "anomalyDetection" ? "anomaly_detection" : tab;
+      await getAlertsFn(store, activeFolderId.value, "", true, apiType);
+    };
+
+    const refreshAlerts = async () => {
+      if (searchAcrossFolders.value && searchQuery.value) {
+        await getAlertsFn(store, activeFolderId.value, searchQuery.value);
+      } else {
+        await getAlertsFn(store, activeFolderId.value);
+      }
+      filterAlertsByTab();
+    };
+
+    onMounted(async () => {
+      await getAlertsByFolderId(store, activeFolderId.value);
+      filterAlertsByTab();
+    });
+    watch(
+      () => store.state.organizationData.foldersByType["alerts"],
+      async (folders) => {
+        if (!folders) return;
+
+        const folderQuery = router.currentRoute.value.query.folder;
+        const matchingFolder = folders.find((it: any) => it.folderId === folderQuery);
+
+        activeFolderId.value = matchingFolder ? folderQuery : "default";
+        filterAlertsByTab();
+      },
+      { immediate: true },
+    );
+    watch(
+      () => activeFolderId.value,
+      async (newVal) => {
+        folderIdToBeCloned.value = newVal;
+        selectedAlerts.value = [];
+        allSelectedAlerts.value = false;
+
+        if (newVal == router.currentRoute.value.query.folder) {
+          // Not refetching here — clear the initial loading flag so the table
+          // doesn't stay stuck on the skeleton.
+          loading.value = false;
+          return;
+        }
+        if (searchAcrossFolders.value) {
+          searchAcrossFolders.value = false;
+          searchQuery.value = "";
+          filteredResults.value = [];
+        }
+        await getAlertsByFolderId(store, newVal);
+        if (router.currentRoute.value.query.folder != newVal) {
+          router.push({
+            name: "alertList",
+            query: {
+              ...router.currentRoute.value.query,
+              org_identifier: store.state.selectedOrganization.identifier,
+              folder: activeFolderId.value,
+            },
+          });
+        }
+        filterAlertsByTab();
+      },
+    );
+
+    watch(searchQuery, async (newQuery) => {
+      selectedAlerts.value = [];
+      allSelectedAlerts.value = false;
+      //here we check the if the new Query is empty and searchAcrossFolders is true
+      //then only we are fetching the alerts by the folderId and then filtering the alerts by the activeTab
+      //this is done because when we click on the any folder that is there in the the row when we do search across folders
+      //at that time also we are resetting theh searchQuery if any so it will trigger this watch which will cause fetching the alerts again
+      //so to avoid we are checking the if the newQuery is empty and searchAcrossFolders is true
+      if (newQuery == "" && searchAcrossFolders.value) {
+        //here we are fetching the alerts by the folderId and then filtering the alerts by the activeTab
+        //this is done because for empty searchQuery we need to fetch the alerts by the folderId
+        await getAlertsByFolderId(store, activeFolderId.value);
+        filterAlertsByTab();
+      } else {
+        //here we are filtering the alerts by the searchQuery
+        await debouncedSearch(newQuery);
+        filterAlertsByTab();
+      }
+    });
+    const showAddUpdateFn = async (props: any) => {
+      //made this async because we need to wait for the router to navigate
+      //so that we can get the alert_type from the query params
+      formData.value = props.row;
+      let action;
+      try {
+        if (!props.row) {
+          isUpdated.value = false;
+          action = "Add Alert";
+          await router.push({
+            name: "alertList",
+            query: {
+              ...router.currentRoute.value.query,
+              action: "add",
+              org_identifier: store.state.selectedOrganization.identifier,
+              folder: activeFolderId.value,
+              alert_type: activeTab.value,
+            },
+          });
+        } else {
+          isUpdated.value = true;
+          action = "Update Alert";
+          await router.push({
+            name: "alertList",
+            query: {
+              ...router.currentRoute.value.query,
+              alert_id: props.row.id,
+              action: "update",
+              name: props.row.name,
+              org_identifier: store.state.selectedOrganization.identifier,
+              folder: activeFolderId.value,
+            },
+          });
+        }
+        addAlert();
+        if (config.enableAnalytics == "true") {
+          segment.track("Button Click", {
+            button: action,
+            user_org: store.state.selectedOrganization.identifier,
+            user_id: store.state.userInfo.email,
+            page: "Alerts",
+          });
+        }
+        track("Button Click", {
+          button: action,
+          page: "Add Alert",
+        });
+      } catch (error) {
+        console.error("Navigation failed:", error);
+      }
+    };
+    watch(
+      () => router.currentRoute.value.query.action,
+      async (action) => {
+        if (!action) {
+          showAddAlertDialog.value = false;
+          showImportAlertDialog.value = false;
+          return;
+        }
+
+        // Handle update action
+        if (action === "update" && router.currentRoute.value.query.alert_id) {
+          const alertId = router.currentRoute.value.query.alert_id as string;
+          try {
+            const alert = await getAlertById(alertId);
+            if (!(await divertSloAlert(alert))) {
+              showAddUpdateFn({ row: alert });
+            }
+          } catch (error) {
+            console.error("AlertList: Failed to load alert", error);
+            toast({
+              variant: "error",
+              message: t("toastMessages.alerts.failedToLoadAlertForEditing"),
+            });
+          }
+        }
+
+        // Handle add action
+        if (action === "add") {
+          showAddUpdateFn({ row: undefined });
+        }
+
+        // Handle import action
+        if (action === "import") {
+          showImportAlertDialog.value = true;
+        }
+      },
+      { immediate: true }, // Run immediately to handle direct navigation
+    );
+    const getDestinations = async () => {
+      destinationService
+        .list({
+          org_identifier: store.state.selectedOrganization.identifier,
+          module: "alert",
+        })
+        .then((res) => {
+          destinations.value = res.data;
+        })
+        .catch(() =>
+          toast({
+            variant: "error",
+            message: t("toastMessages.alerts.errorWhileFetchingDestinations"),
+          }),
+        );
+    };
+
+    const getTemplates = () => {
+      templateService
+        .list({
+          org_identifier: store.state.selectedOrganization.identifier,
+        })
+        .then((res) => {
+          templates.value = res.data;
+        })
+        .catch(() =>
+          toast({
+            variant: "error",
+            message: t("toastMessages.alerts.errorWhileFetchingTemplates"),
+          }),
+        );
+    };
+    const pageSize = ref<number>(savedAlertListFilters.perPage || 20);
+    const pageSizeOptions = [20, 50, 100, 250, 500];
+    const resultTotal = computed(function () {
+      return displayedAlerts.value?.length;
+    });
+
+    // No timezone suffix in this table, unlike the other lists.
+    const convertUnixToDateFormat = (unixMicroseconds: any) =>
+      convertUnixToFormat(unixMicroseconds, "YYYY-MM-DD HH:mm:ss");
+
+    const addAlert = () => {
+      showAddAlertDialog.value = true;
+    };
+
+    const duplicateAlert = async (row: any) => {
+      // SLO alerts are not clonable (D1). The dialog's first act is to demand a
+      // stream type and name, which this family has none of — and a clone that
+      // did succeed would be a creation path outside the SLO page that silently
+      // consumes one of the SLO's eight burn-window pair slots.
+      //
+      // Keyed on "is an SLO alert", NOT on "has a resolvable SLO": an SLO alert
+      // whose condition is missing is the row a clone would corrupt hardest.
+      // The disabled button is the affordance; this is what makes a keyboard
+      // shortcut or a stale handler harmless.
+      if (isSloRow(row)) return;
+      toBeClonedID.value = row.alert_id;
+      toBeCloneAlertName.value = row.name;
+      toBeClonedIsAnomaly.value = row.type === "anomaly";
+      toBeClonestreamName.value = "";
+      toBeClonestreamType.value = "";
+      showForm.value = true;
+      // Anomaly rows use the /clone endpoint — no need to pre-fetch full data
+      if (!toBeClonedIsAnomaly.value) {
+        toBeClonedAlert.value = await getAlertById(row.alert_id);
+      }
+    };
+    const submitForm = async () => {
+      // Anomaly rows: use the dedicated /clone endpoint (no fetch+mutate dance needed)
+      if (toBeClonedIsAnomaly.value) {
+        if (!toBeClonestreamType.value) {
+          toast({
+            variant: "error",
+            message: t("toastMessages.alerts.pleaseSelectStreamType"),
+          });
+          return;
+        }
+        if (!toBeClonestreamName.value) {
+          toast({
+            variant: "error",
+            message: t("toastMessages.alerts.pleaseSelectStreamName"),
+          });
+          return;
+        }
+        isSubmitting.value = true;
+        const dismiss = toast({
+          variant: "loading",
+          message: t("toastMessages.alerts.pleaseWait"),
+          timeout: 0,
+        });
+        try {
+          await alertsService.clone_by_id(
+            store.state.selectedOrganization.identifier,
+            toBeClonedID.value,
+            {
+              name: toBeCloneAlertName.value,
+              folder_id: (folderIdToBeCloned.value as string) || "default",
+              stream_type: toBeClonestreamType.value,
+              stream_name: toBeClonestreamName.value,
+            },
+            folderIdToBeCloned.value,
+          );
+          dismiss();
+          toast({
+            variant: "success",
+            message: t("toastMessages.alerts.anomalyDetectionClonedSuccessfully"),
+          });
+          showForm.value = false;
+          await getAlertsFn(store, folderIdToBeCloned.value);
+          activeFolderId.value = folderIdToBeCloned.value;
+        } catch (e: any) {
+          dismiss();
+          toast({
+            variant: "error",
+            message: e?.response?.data?.message || t("alerts.messages.cloneAnomalyFailed"),
+          });
+        } finally {
+          isSubmitting.value = false;
+        }
+        return;
+      }
+
+      if (!toBeClonedAlert.value) {
+        toast({
+          variant: "error",
+          message: t("toastMessages.alerts.alertNotFound"),
+        });
+        return;
+      }
+      if (!toBeClonestreamType.value) {
+        toast({
+          variant: "error",
+          message: t("toastMessages.alerts.pleaseSelectStreamType"),
+        });
+        return;
+      }
+      if (!toBeClonestreamName.value) {
+        toast({
+          variant: "error",
+          message: t("toastMessages.alerts.pleaseSelectStreamName"),
+        });
+        return;
+      }
+      isSubmitting.value = true;
+      const dismiss = toast({
+        variant: "loading",
+        message: t("toastMessages.alerts.pleaseWait"),
+        timeout: 0,
+      });
+
+      toBeClonedAlert.value.name = toBeCloneAlertName.value;
+      toBeClonedAlert.value.stream_name = toBeClonestreamName.value;
+      toBeClonedAlert.value.stream_type = toBeClonestreamType.value;
+      toBeClonedAlert.value.folder_id = activeFolderId.value;
+      try {
+        //removed id from the alert payload
+        if (toBeClonedAlert.value?.id) {
+          delete toBeClonedAlert.value?.id;
+        }
+        //assigning the owner from the alert payload because the current logged in user will be the owner of the cloned alert
+        toBeClonedAlert.value.owner = store.state.userInfo.email;
+        //assigning the last_edited_by from the alert payload because the current logged in user will be the last_edited_by of the cloned alert
+        toBeClonedAlert.value.last_edited_by = store.state.userInfo.email;
+        //here using the folderIdToBeCloned.value because we need to clone the alert in the folder which is selected by the user
+        alertsService
+          .create_by_alert_id(
+            store.state.selectedOrganization.identifier,
+            toBeClonedAlert.value,
+            folderIdToBeCloned.value,
+          )
+          .then(async (res) => {
+            dismiss();
+            if (res.data.code == 200) {
+              toast({
+                variant: "success",
+                message: t("toastMessages.alerts.alertClonedSuccessfully"),
+              });
+              showForm.value = false;
+              await getAlertsFn(store, folderIdToBeCloned.value);
+              activeFolderId.value = folderIdToBeCloned.value;
+            } else {
+              toast({
+                variant: "error",
+                message: res.data.message,
+              });
+            }
+          })
+          .catch((e: any) => {
+            if (e.response?.status == 403) {
+              showForm.value = false;
+              isSubmitting.value = false;
+              return;
+            }
+            dismiss();
+            toast({
+              variant: "error",
+              message: e.response.data.message,
+            });
+          })
+          .finally(() => {
+            isSubmitting.value = false;
+          });
+      } catch (e: any) {
+        showForm.value = true;
+        isSubmitting.value = false;
+        toast({
+          variant: "error",
+          message: e.data.message,
+        });
+      }
+    };
+    const refreshList = async (folderId?: string) => {
+      //here we are fetching the alerts from the server because after creating the alert we should get the latest alerts
+      //and then we are setting the activeFolderId to the folderId
+      //this is done to avoid multiple api calls , when we assign the folderId before fetching it will trigger the watch and it will fetch the alerts again
+      //and we dont need to fetch the alerts again because we are already fetching the alerts in the getAlertsFn
+      const resolvedFolderId = folderId || activeFolderId.value || "default";
+      // Always fetch the latest alerts for the folder from backend
+      await getAlertsFn(store, resolvedFolderId);
+      // Re-apply active search/filter on the freshly fetched data
+      if (filterQuery.value) {
+        filterAlertsByQuery(filterQuery.value);
+      }
+      await hideForm();
+      activeFolderId.value = resolvedFolderId;
+    };
+    const hideForm = async () => {
+      showAddAlertDialog.value = false;
+      await router.push({
+        name: "alertList",
+        query: {
+          org_identifier: store.state.selectedOrganization.identifier,
+          folder: activeFolderId.value,
+          tab: activeTab.value,
+        },
+      });
+      track("Button Click", {
+        button: "Hide Form",
+        page: "Add Alert",
+      });
+    };
+    // A delete is one row leaving a list the server has already confirmed. Splice
+    // it out — of the rows, the filtered view, the selection AND the per-folder
+    // cache a folder revisit is served from — instead of refetching every alert in
+    // the folder behind a loading toast and the table's skeleton, which reads as a
+    // page reload and takes the user's scroll and page with it.
+    const dropAlerts = (alertIds: any[]) => {
+      const gone = new Set(alertIds.filter(Boolean).map((id: any) => String(id)));
+      if (!gone.size) return;
+
+      const keep = (row: any) => !gone.has(String(row?.alert_id));
+      allAlerts.value = allAlerts.value.filter(keep);
+      filteredResults.value = filteredResults.value.filter(keep);
+      // Anything that failed to delete stays selected, so a bulk retry is one click.
+      selectedAlertIds.value = selectedAlertIds.value.filter((id: string) => !gone.has(String(id)));
+
+      // Without this the row returns the moment the user leaves the folder and
+      // comes back — that path reads the store, never the API. EVERY cached
+      // folder, not just the active one: a cross-folder search deletes alerts
+      // that live elsewhere, and that folder's own cache still holds them.
+      const byFolder = store.state.organizationData.allAlertsListByFolderId;
+      if (byFolder && typeof byFolder === "object") {
+        const pruned = Object.fromEntries(
+          Object.entries(byFolder).map(([folderId, rows]) => [
+            folderId,
+            Array.isArray(rows) ? rows.filter(keep) : rows,
+          ]),
+        );
+        store.dispatch("setAllAlertsListByFolderId", pruned);
+      }
+
+      // The alert is gone from every destination and template that referenced it.
+      invalidateDependencyGraphCache();
+    };
+
+    const deleteAlertByAlertId = () => {
+      alertsService
+        .delete_by_alert_id(
+          store.state.selectedOrganization.identifier,
+          selectedDelete.value.alert_id,
+          activeFolderId.value,
+        )
+        .then(async (res: any) => {
+          if (res.data.code == 200) {
+            toast({
+              variant: "success",
+              message: res.data.message,
+            });
+            dropAlerts([selectedDelete.value.alert_id]);
+          } else {
+            toast({
+              variant: "error",
+              message: res.data.message,
+            });
+          }
+        })
+        .catch((err) => {
+          if (err.response?.status == 403) {
+            return;
+          }
+          if (err.response?.status === 409 && err.response?.data?.code === "child_referenced") {
+            openReferenceConflict({
+              alert_id: selectedDelete.value.alert_id,
+              ...err.response.data,
+            });
+            return;
+          }
+          toast({
+            variant: "error",
+            message: err?.data?.message || t("alerts.messages.deleteAlertFailed"),
+          });
+        });
+      if (config.enableAnalytics == "true") {
+        segment.track("Button Click", {
+          button: "Delete Alert",
+          user_org: store.state.selectedOrganization.identifier,
+          user_id: store.state.userInfo.email,
+          alert_name: selectedDelete.value.name,
+          page: "Alerts",
+        });
+      }
+    };
+    const showDeleteDialogFn = (props: any) => {
+      selectedDelete.value = props.row;
+      confirmDelete.value = true;
+    };
+    const filterColumns = (options: any[], val: String, update: Function) => {
+      let filteredOptions: any[] = [];
+      if (val === "") {
+        update(() => {
+          filteredOptions = [...options];
+        });
+        return filteredOptions;
+      }
+      update(() => {
+        const value = val.toLowerCase();
+        filteredOptions = options.filter((column: any) => column.toLowerCase().indexOf(value) > -1);
+      });
+      return filteredOptions;
+    };
+    const updateStreamName = (selectedOption: any) => {
+      toBeClonestreamName.value = selectedOption;
+    };
+    const updateStreams = (resetStream = true) => {
+      if (resetStream) toBeClonestreamName.value = "";
+      if (streams.value[toBeClonestreamType.value]) {
+        schemaList.value = streams.value[toBeClonestreamType.value];
+        indexOptions.value = streams.value[toBeClonestreamType.value].map((data: any) => {
+          return data.name;
+        });
+        updateStreamName(toBeClonestreamName.value);
+
+        return;
+      }
+
+      if (!toBeClonestreamType.value) return Promise.resolve();
+
+      isFetchingStreams.value = true;
+      return getStreams(toBeClonestreamType.value, false)
+        .then((res: any) => {
+          streams.value[toBeClonestreamType.value] = res.list;
+          schemaList.value = res.list;
+          indexOptions.value = res.list.map((data: any) => {
+            return data.name;
+          });
+
+          return Promise.resolve();
+        })
+        .catch(() => Promise.reject())
+        .finally(() => (isFetchingStreams.value = false));
+    };
+    const filterStreams = (val: string, update: any) => {
+      streamNames.value = filterColumns(indexOptions.value, val, update);
+    };
+
+    const toggleAlertState = (row: any) => {
+      alertStateLoadingMap.value[row.uuid] = true;
+
+      alertsService
+        .toggle_state_by_alert_id(
+          store.state.selectedOrganization.identifier,
+          row.alert_id,
+          !row?.enabled,
+          activeFolderId.value,
+        )
+        .then((res: any) => {
+          const isEnabled = res.data.enabled;
+          filteredResults.value.forEach((alert: any) => {
+            alert.uuid === row.uuid ? (alert.enabled = isEnabled) : null;
+          });
+          toast({
+            variant: "success",
+            message: isEnabled
+              ? t("toastMessages.alerts.alertResumedSuccessfully")
+              : t("toastMessages.alerts.alertPausedSuccessfully"),
+          });
+        })
+        .finally(() => {
+          alertStateLoadingMap.value[row.uuid] = false;
+        });
+    };
+
+    const routeTo = (name: string) => {
+      router.push({
+        name: name,
+        query: {
+          action: "add",
+          org_identifier: store.state.selectedOrganization.identifier,
+          folder: activeFolderId.value,
+        },
+      });
+    };
+
+    const refreshDestination = async () => {
+      await getDestinations();
+    };
+
+    const importAlert = () => {
+      showImportAlertDialog.value = true;
+      router.push({
+        name: "alertList",
+        query: {
+          action: "import",
+          org_identifier: store.state.selectedOrganization.identifier,
+          folder: activeFolderId.value,
+        },
+      });
+    };
+
+    const goToAlertInsights = () => {
+      router.push({
+        name: "alertInsights",
+        query: {
+          org_identifier: store.state.selectedOrganization.identifier,
+        },
+      });
+    };
+
+    const goToAlertHistory = () => {
+      router.push({
+        name: "alertHistory",
+        query: {
+          org_identifier: store.state.selectedOrganization.identifier,
+        },
+      });
+    };
+
+    // ── Export ────────────────────────────────────────────────────────────────
+    // Export opens a dialog rather than downloading straight away: the same
+    // definition can leave as JSON or as an openobserve_alert Terraform resource,
+    // and the user picks there.
+    const showExportDialog = ref(false);
+    const alertsToExport = ref<Record<string, unknown>[]>([]);
+    // Converted here rather than inside the dialog: each resource type has its
+    // own exporter, and the dialog only renders what it is handed.
+    const alertsTerraform = computed(() =>
+      alertsToTerraform(alertsToExport.value, { folderId: activeFolderId.value }),
+    );
+    const exportLoading = ref(false);
+
+    // The /export endpoint strips runtime fields from anomaly configs and works
+    // for ordinary alerts too.
+    const fetchAlertForExport = async (alertId: string) => {
+      const res = await alertsService.export_by_id(
+        store.state.selectedOrganization.identifier,
+        alertId,
+      );
+      const data = res.data;
+      // An id belongs to the alert that was exported, not to the one this
+      // definition will create.
+      if (data && Object.prototype.hasOwnProperty.call(data, "id")) delete data.id;
+      return data;
+    };
+
+    const exportAlert = async (row: any) => {
+      if (exportLoading.value) return;
+      exportLoading.value = true;
+      try {
+        const alert = await fetchAlertForExport(row.alert_id);
+        if (!alert) throw new Error("empty export payload");
+        alertsToExport.value = [alert];
+        showExportDialog.value = true;
+      } catch (error: any) {
+        toast({
+          variant: "error",
+          message:
+            raw(error?.response?.data?.message) ||
+            t("toastMessages.alerts.errorExportingAlertsPleaseTryAgain"),
+        });
+      } finally {
+        exportLoading.value = false;
+      }
+    };
+
+    const onExportDownloaded = ({ count }: { format: string; count: number }) => {
+      toast({
+        variant: "success",
+        message: t("toastMessages.alerts.successfullyExportedAlert", { count }, count),
+      });
+      selectedAlerts.value = [];
+      allSelectedAlerts.value = false;
+    };
+
+    const triggerAlert = async (row: any) => {
+      try {
+        await alertsService.trigger_alert(
+          store.state.selectedOrganization.identifier,
+          row.alert_id,
+          row.folder_name?.id,
+        );
+        toast({
+          variant: "success",
+          message: t("alerts.alertTriggeredSuccess"),
+        });
+        if (row.type === "anomaly") {
+          await getAlertsFn(store, activeFolderId.value);
+        }
+      } catch (error: any) {
+        toast({
+          variant: "error",
+          message: error?.response?.data?.message || t("alerts.messages.triggerAlertFailed"),
+        });
+      }
+    };
+
+    const retrainAnomaly = async (row: any) => {
+      try {
+        await alertsService.retrain_by_id(
+          store.state.selectedOrganization.identifier,
+          row.alert_id,
+        );
+        row.status = "training";
+        toast({
+          variant: "success",
+          message: t("toastMessages.alerts.retrainingTriggered"),
+        });
+      } catch (error: any) {
+        toast({
+          variant: "error",
+          message: error?.response?.data?.message || t("alerts.messages.triggerRetrainingFailed"),
+        });
+      }
+    };
+
+    const updateActiveFolderId = async (newVal: any) => {
+      //this is the condition we kept because when we we click on the any folder that is there in the the row when we do search across folders
+      //at that time if it is the same folder it wont trigger the watch and it will show the alerts of the filtered only
+      //so we are fetching the alerts by the folderId and then filtering the alerts by the activeTab this is done explicitly on only if users clicks on same folder
+      if (newVal == activeFolderId.value) {
+        if (isRestoringState.value) {
+          // Force fresh fetch from backend (cache may be stale after add/edit on another route)
+          isRestoringState.value = false;
+          await getAlertsFn(store, newVal);
+          if (searchAcrossFolders.value && searchQuery.value) {
+            await getAlertsFn(store, activeFolderId.value, searchQuery.value);
+            filterAlertsByTab();
+          } else if (filterQuery.value) {
+            filterAlertsByQuery(filterQuery.value);
+          } else {
+            filterAlertsByTab();
+          }
+          return;
+        }
+        await getAlertsByFolderId(store, newVal);
+        filterAlertsByTab();
+      }
+      // When restoring state from a prior navigation, skip clearing search filters
+      if (isRestoringState.value) {
+        isRestoringState.value = false;
+        await getAlertsFn(store, newVal);
+        if (filterQuery.value) {
+          filterAlertsByQuery(filterQuery.value);
+        } else {
+          filterAlertsByTab();
+        }
+        activeFolderId.value = newVal;
+        return;
+      }
+      //here we are resetting the searchQuery, filterQuery, searchAcrossFolders, allSelectedAlerts, selectedAlerts
+      //here we only reset if the value is not null
+      if (searchQuery.value) searchQuery.value = "";
+      if (filterQuery.value) filterQuery.value = "";
+      if (searchAcrossFolders.value) searchAcrossFolders.value = false;
+      if (allSelectedAlerts.value) allSelectedAlerts.value = false;
+      if (selectedAlerts.value) selectedAlerts.value = [];
+      activeFolderId.value = newVal;
+      //here we are resetting the selected alerts
+      //this is done because we need to reset the selected alerts when the user is changing the folder
+      //this is not needed but we are doing it to avoid any potential issues
+      filteredResults.value?.forEach((alert: any) => {
+        alert.selected = false;
+      });
+    };
+
+    const editAlert = async (row: any) => {
+      // SLO alerts are authored on the SLO page: the generic editor has no way
+      // to represent one (no stream, no query, a different condition), and
+      // saving from it would either fail forever or strip the SLO wiring.
+      const sloRoute = sloAlertEditRoute(row, store.state.selectedOrganization.identifier);
+      if (sloRoute) {
+        await router.push(sloRoute);
+        return;
+      }
+      if (isUnplaceableSloAlert(row)) {
+        // An SLO alert whose SLO cannot be resolved. Falling through would open
+        // the generic editor on an alert it cannot represent.
+        toast({ variant: "error", message: t("alerts.sloAlertUnplaceable") });
+        return;
+      }
+      // Anomaly detection rows route to the dedicated edit page
+      if (row.type === "anomaly") {
+        await router.push({
+          name: "editAnomalyDetection",
+          params: { anomaly_id: row.alert_id },
+          query: {
+            org_identifier: store.state.selectedOrganization.identifier,
+            folder: activeFolderId.value,
+            tab: activeTab.value,
+          },
+        });
+        return;
+      }
+      // Don't fetch alert data here - let the watcher handle it to avoid duplicate API calls
+      // Just trigger the route change with alert_id, the watcher will fetch and call showAddUpdateFn
+      await router.push({
+        name: "alertList",
+        query: {
+          ...router.currentRoute.value.query,
+          alert_id: row.alert_id,
+          action: "update",
+          name: row.name,
+          org_identifier: store.state.selectedOrganization.identifier,
+          folder: activeFolderId.value,
+        },
+      });
+    };
+
+    const moveAlertToAnotherFolder = (row: any) => {
+      showMoveAlertDialog.value = true;
+      if (row.type === "anomaly") {
+        selectedAlertToMove.value = [];
+        selectedAnomalyConfigsToMove.value = [row.alert_id];
+      } else {
+        selectedAlertToMove.value = [row.alert_id];
+        selectedAnomalyConfigsToMove.value = [];
+      }
+      activeFolderToMove.value = activeFolderId.value;
+    };
+
+    // A delete inside the dependency popover — reload the current folder's alerts
+    // so the table drops the removed row.
+    const onDependencyDeleted = () => getAlertsFn(store, activeFolderId.value);
+
+    const updateAcrossFolders = async (activeFolderId: any, selectedFolderId: any) => {
+      //here we are fetching the alerts of the selected folder first and then fetching the alerts of the active folder
+      if (selectedFolderId === activeFolderId) {
+        await getAlertsFn(store, activeFolderId);
+      } else {
+        await getAlertsFn(store, selectedFolderId, "", false);
+        await getAlertsFn(store, activeFolderId);
+      }
+      showMoveAlertDialog.value = false;
+      selectedAlertToMove.value = [];
+      selectedAnomalyConfigsToMove.value = [];
+      activeFolderToMove.value = "";
+      selectedAlerts.value = [];
+      allSelectedAlerts.value = false;
+    };
+
+    const moveMultipleAlerts = () => {
+      showMoveAlertDialog.value = true;
+      selectedAlertToMove.value = selectedAlerts.value
+        .filter((alert: any) => alert.type !== "anomaly")
+        .map((alert: any) => alert.alert_id);
+      selectedAnomalyConfigsToMove.value = selectedAlerts.value
+        .filter((alert: any) => alert.type === "anomaly")
+        .map((alert: any) => alert.alert_id);
+      activeFolderToMove.value = activeFolderId.value;
+    };
+
+    const dynamicQueryModel = computed({
+      get() {
+        return searchAcrossFolders.value ? searchQuery.value : filterQuery.value;
+      },
+      set(value) {
+        if (searchAcrossFolders.value) {
+          searchQuery.value = value;
+          // filterQuery.value = value;
+        } else {
+          filterQuery.value = value;
+          // searchQuery.value = value;
+        }
+      },
+    });
+
+    const clearSearchHistory = () => {
+      searchQuery.value = "";
+      filteredResults.value = [];
+    };
+
+    const debouncedSearch = debounce(async (query) => {
+      if (!query) return;
+      const dismiss = toast({
+        variant: "loading",
+        message: t("toastMessages.alerts.pleaseWaitWhileSearchingForDashboards"),
+        timeout: 0,
+      });
+      dismiss();
+      await getAlertsFn(store, activeFolderId.value, query);
+    }, 600);
+
+    watch(filterQuery, (newVal) => {
+      if (newVal == "") {
+        filterAlertsByTab();
+      }
+      if (newVal) {
+        filterAlertsByQuery(newVal);
+      }
+    });
+    watch(searchAcrossFolders, (newVal) => {
+      selectedAlerts.value = [];
+      allSelectedAlerts.value = false;
+      if (newVal) {
+        //here we are setting the searchQuery to null and then setting the filterQuery to the searchQuery
+        //this is done because we want to clear the searchQuery and then set the filterQuery to the searchQuery
+        searchQuery.value = null;
+        searchQuery.value = filterQuery.value;
+        filterQuery.value = null;
+      }
+      if (!newVal) {
+        //here we are restoring the current folder's alerts and re-filtering by the active tab
+        //this ensures cross-folder results are cleared and only the current folder's data is shown
+        const currentFolderAlerts =
+          store.state.organizationData.allAlertsListByFolderId[activeFolderId.value] || [];
+        allAlerts.value = currentFolderAlerts;
+        filterQuery.value = null;
+        searchQuery.value = null;
+        filterAlertsByTab();
+      }
+    });
+    // Persist filter state to Vuex so it survives navigation to add/edit screens
+    watch([searchQuery, filterQuery, searchAcrossFolders, pageSize], () => {
+      store.commit("setAlertListFilters", {
+        searchQuery: searchQuery.value || "",
+        filterQuery: filterQuery.value || "",
+        searchAcrossFolders: !!searchAcrossFolders.value,
+        perPage: pageSize.value,
+      });
+    });
+    watch(activeTab, async (newVal) => {
+      //here we are resetting the filterQuery when the activeTab is changed
+      //this is done because we need to trigger again the filterQuery watch
+      if (filterQuery.value) {
+        let tempQuery = filterQuery.value;
+        filterQuery.value = null;
+        await nextTick();
+        filterQuery.value = tempQuery;
+      }
+      //here we are filtering the alerts by the activeTab
+      filterAlertsByTab();
+
+      // Update URL query parameter to persist tab state across page refreshes
+      router.push({
+        query: { ...router.currentRoute.value.query, tab: newVal },
+      });
+    });
+
+    const openMenu = (event: Event, _row?: unknown) => {
+      event.stopPropagation();
+    };
+
+    const multipleExportAlert = async () => {
+      if (exportLoading.value) return;
+      exportLoading.value = true;
+      const dismiss = toast({
+        variant: "loading",
+        message: t("toastMessages.alerts.exportingAlerts"),
+        timeout: 0, // Set timeout to 0 to keep it showing until dismissed
+      });
+      try {
+        const selected = selectedAlerts.value as any[];
+        const fetched = await Promise.all(
+          selected.map((alert: any) => fetchAlertForExport(alert.alert_id)),
+        );
+        const usable = fetched.filter(Boolean);
+        // Every fetch coming back empty is a failure, not an export of nothing:
+        // without this the dialog opens on a blank definition.
+        if (!usable.length) throw new Error("empty export payload");
+        alertsToExport.value = usable;
+        showExportDialog.value = true;
+
+        // A definition that came back empty is a gap in the export. Dropping it
+        // quietly would leave the success toast reporting the smaller count as
+        // though everything had been exported.
+        const missing = selected.filter((_, i) => !fetched[i]).map((alert: any) => alert.name);
+        if (missing.length) {
+          toast({
+            variant: "warning",
+            message: t("toastMessages.alerts.someAlertsCouldNotBeExported", {
+              names: missing.join(", "),
+            }),
+          });
+        }
+      } catch (error) {
+        console.error("Error exporting alerts:", error);
+        toast({
+          variant: "error",
+          message: t("toastMessages.alerts.errorExportingAlertsPleaseTryAgain"),
+        });
+      } finally {
+        dismiss();
+        exportLoading.value = false;
+      }
+    };
+    const computedOwner = (owner: string) => {
+      if (!owner) {
+        return "--";
+      }
+      if (owner.length > 15) {
+        const firstTen = owner.substring(0, 7);
+        const lastFour = owner.substring(owner.length - 4);
+        return firstTen + "****" + lastFour;
+      }
+      return owner;
+    };
+
+    //this function is used to refresh the imported alerts
+    const refreshImportedAlerts = async (store: any, folderId: any) => {
+      await getAlertsFn(store, folderId);
+    };
+    const updateFolderIdToBeCloned = (folderId: any) => {
+      folderIdToBeCloned.value = folderId.value;
+    };
+
+    // V1 format: {or: [...]} or {and: [...]}
+    function transformToExpression(data: any, wrap = true): any {
+      if (!data) return null;
+
+      const keys = Object.keys(data);
+      if (keys.length !== 1) return null;
+
+      const label = keys[0].toUpperCase(); // AND or OR
+      const itemsArray = data[label.toLowerCase()];
+
+      const parts = itemsArray.map((item: any) => {
+        if (item.and || item.or) {
+          return transformToExpression(item, true); // wrap nested groups
+        } else {
+          const column = item.column;
+          const operator = item.operator;
+          const value = typeof item.value === "string" ? `'${item.value}'` : item.value;
+          return `${column} ${operator} ${value}`;
+        }
+      });
+
+      const joined = parts.join(` ${label} `);
+      return wrap ? `(${joined})` : joined;
+    }
+
+    //this function is used to filter the alerts by the local search not the global search
+    //this will be used when the user is searching for the alerts in the same folder
+    const filterAlertsByQuery = (query: string) => {
+      let tempResults = allAlerts.value.filter((alert: any) =>
+        alert.name.toLowerCase().includes(query.toLowerCase()),
+      );
+      filteredResults.value = tempResults.filter((alert: any) => {
+        if (activeTab.value === "scheduled") {
+          return !alert.is_real_time && alert.alert_type !== "Composite";
+        } else if (activeTab.value === "realTime") {
+          return alert.is_real_time === true;
+        } else if (activeTab.value === "anomalyDetection") {
+          return alert.is_real_time === "anomaly";
+        } else if (activeTab.value === "composite") {
+          return alert.alert_type === "Composite";
+        } else {
+          return true;
+        }
+      });
+    };
+
+    const bulkToggleAlerts = async (action: "pause" | "resume") => {
+      const dismiss = toast({
+        variant: "loading",
+        message:
+          action === "resume"
+            ? t("toastMessages.alerts.resumingAlerts")
+            : t("toastMessages.alerts.pausingAlerts"),
+        timeout: 0,
+      });
+      try {
+        const isResuming = action === "resume";
+
+        // Filter alerts based on action
+        const alertsToToggle = selectedAlerts.value.filter((alert: any) =>
+          isResuming ? !alert.enabled : alert.enabled,
+        );
+
+        if (alertsToToggle.length === 0) {
+          toast({
+            variant: "error",
+            message:
+              action === "resume"
+                ? t("toastMessages.alerts.noAlertsToResume")
+                : t("toastMessages.alerts.noAlertsToPause"),
+          });
+          dismiss();
+          return;
+        }
+
+        // Collect IDs and names
+        const payload = {
+          ids: alertsToToggle.map((a: any) => a.alert_id),
+          names: alertsToToggle.map((a: any) => a.name),
+        };
+
+        // Toggle (true = resume, false = pause)
+        const response = await alertsService.bulkToggleState(
+          store.state.selectedOrganization.identifier,
+          isResuming,
+          payload,
+        );
+
+        if (response) {
+          dismiss();
+          toast({
+            variant: "success",
+            message:
+              action === "resume"
+                ? t("toastMessages.alerts.alertsResumedSuccessfully")
+                : t("toastMessages.alerts.alertsPausedSuccessfully"),
+          });
+        }
+        // Refresh alerts
+        await getAlertsFn(store, activeFolderId.value);
+
+        if (filterQuery.value) {
+          filterAlertsByQuery(filterQuery.value);
+        }
+      } catch (error) {
+        dismiss();
+        console.error(`Error ${action}ing alerts:`, error);
+        toast({
+          variant: "error",
+          message:
+            action === "resume"
+              ? t("toastMessages.alerts.errorResumingAlerts")
+              : t("toastMessages.alerts.errorPausingAlerts"),
+        });
+      }
+    };
+
+    const confirmBulkDelete = ref<boolean>(false);
+    const bulkDeleteLoading = ref<boolean>(false);
+
+    const openBulkDeleteDialog = () => {
+      confirmBulkDelete.value = true;
+    };
+
+    const bulkDeleteAlerts = async () => {
+      bulkDeleteLoading.value = true;
+      const dismiss = toast({
+        variant: "loading",
+        message: t("toastMessages.alerts.deletingAlerts"),
+        timeout: 0,
+      });
+
+      try {
+        if (selectedAlerts.value.length === 0) {
+          toast({
+            variant: "error",
+            message: t("toastMessages.alerts.noAlertsSelectedForDeletion"),
+          });
+          dismiss();
+          return;
+        }
+
+        // Extract alert ids
+        const payload = {
+          ids: selectedAlerts.value.map((a: any) => a.alert_id),
+        };
+
+        const response = await alertsService.bulkDelete(
+          store.state.selectedOrganization.identifier,
+          payload,
+          activeFolderId.value,
+        );
+
+        dismiss();
+
+        // Handle response based on successful/unsuccessful arrays
+        if (response.data) {
+          const { successful = [], unsuccessful = [] } = response.data;
+          const successCount = successful.length;
+          const failCount = unsuccessful.length;
+          const referenceFailure = unsuccessful.find(
+            (failure: any) => failure.code === "child_referenced",
+          );
+          if (referenceFailure) openReferenceConflict(referenceFailure);
+
+          if (failCount > 0 && successCount > 0) {
+            // Partial success
+            toast({
+              variant: "warning",
+              message: t("toastMessages.alerts.alertsDeletedWithFailures", {
+                count: successCount,
+                failed: failCount,
+              }),
+              timeout: 5000,
+            });
+          } else if (failCount > 0) {
+            // All failed
+            toast({
+              variant: "error",
+              message: t("toastMessages.alerts.failedToDeleteAlerts", { count: failCount }),
+            });
+          } else {
+            // All successful
+            toast({
+              variant: "success",
+              message: t("toastMessages.alerts.alertsDeletedSuccessfully", { count: successCount }),
+            });
+          }
+        } else {
+          // Fallback success message
+          toast({
+            variant: "success",
+            message: t("toastMessages.alerts.alertsDeletedSuccessfully", {
+              count: selectedAlerts.value.length,
+            }),
+          });
+        }
+
+        // `successful` carries the ids the server actually deleted; the shape has
+        // varied, so accept a bare id or an object carrying one. An unrecognised
+        // shape is NOT taken as "all of them" — splicing rows the server may have
+        // kept would show a delete that never happened; refetch and let the
+        // server say.
+        if (Array.isArray(response.data?.successful)) {
+          dropAlerts(
+            response.data.successful.map((entry: any) => entry?.alert_id ?? entry?.id ?? entry),
+          );
+        } else {
+          selectedAlerts.value = [];
+          await getAlertsFn(store, activeFolderId.value);
+          if (filterQuery.value) filterAlertsByQuery(filterQuery.value);
+        }
+      } catch (error: any) {
+        dismiss();
+
+        // Show error message from response if available
+        const errorMessage =
+          error.response?.data?.message ||
+          error?.message ||
+          t("alerts.messages.bulkDeleteAlertsFailed");
+        if (error.response?.status != 403 || error?.status != 403) {
+          toast({
+            variant: "error",
+            message: errorMessage,
+          });
+        }
+      } finally {
+        bulkDeleteLoading.value = false;
+      }
+
+      confirmBulkDelete.value = false;
+    };
+
+    // ── Keyboard shortcuts ──────────────────────────────────────────────
+    useShortcuts([
+      {
+        id: "alertsCreate",
+        handler: () => {
+          if (isInputFocused()) return;
+          // Mirror the Add button so the URL updates (action=add / route push),
+          // otherwise "go back"/discard can't return to the list.
+          if (!destinations.value.length || !templates.value.length) return;
+          if (activeTab.value === "anomalyDetection") {
+            router.push({
+              name: "addAnomalyDetection",
+              query: {
+                org_identifier: store.state.selectedOrganization.identifier,
+                folder: activeFolderId.value,
+                tab: activeTab.value,
+              },
+            });
+          } else {
+            showAddUpdateFn({});
+          }
+        },
+      },
+      {
+        id: "alertsImport",
+        handler: () => {
+          if (isInputFocused()) return;
+          importAlert();
+        },
+      },
+      {
+        id: "alertsRefresh",
+        handler: () => {
+          if (isInputFocused()) return;
+          refreshAlerts();
+        },
+      },
+      {
+        id: "alertsFocusSearch",
+        handler: () => {
+          focusSearchInput("alert-list-search-input");
+        },
+      },
+    ]);
+
+    return {
+      raw,
+      t,
+      store,
+      router,
+      onDependencyDeleted,
+      columns,
+      recencyLevel,
+      alertRowClass,
+      alertRowStyle,
+      typeIconName,
+      typeIconClass,
+      isSloRow,
+      sloLabel,
+      goToSlo,
+      stateCounts,
+      summaryStats,
+      stateFilter,
+      displayedAlerts,
+      onStatSelect,
+      formData,
+      hideForm,
+      confirmDelete,
+      selectedDelete,
+      updateStreams,
+      updateStreamName,
+      resultTotal,
+      refreshList,
+      pageSize,
+      pageSizeOptions,
+      addAlert,
+      isUpdated,
+      showAddUpdateFn,
+      showDeleteDialogFn,
+      duplicateAlert,
+      showAddAlertDialog,
+      showForm,
+      toBeCloneAlertName,
+      toBeClonedIsAnomaly,
+      toBeClonestreamType,
+      toBeClonestreamName,
+      streamTypes,
+      filterColumns,
+      filterStreams,
+      streamNames,
+      submitForm,
+      schemaList,
+      indexOptions,
+      streams,
+      isFetchingStreams,
+      loading,
+      isSubmitting,
+      filterQuery,
+      getImageURL,
+      activeTab,
+      destinations,
+      verifyOrganizationStatus,
+      folders,
+      splitterModel,
+      alertStateLoadingMap,
+      showRunOutcome,
+      runOutcomeTooltip,
+      toggleAlertState,
+      templates,
+      routeTo,
+      refreshDestination,
+      showImportAlertDialog,
+      importAlert,
+      goToAlertInsights,
+      goToAlertHistory,
+      getTemplates,
+      exportAlert,
+      showExportDialog,
+      alertsToExport,
+      alertsTerraform,
+      onExportDownloaded,
+      triggerAlert,
+      retrainAnomaly,
+      updateActiveFolderId,
+      activeFolderId,
+      editAlert,
+      deleteAlertByAlertId,
+      showMoveAlertDialog,
+      selectedAlertToMove,
+      selectedAnomalyConfigsToMove,
+      moveAlertToAnotherFolder,
+      activeFolderToMove,
+      updateAcrossFolders,
+      selectedAlerts,
+      selectedAlertIds,
+      moveMultipleAlerts,
+      dynamicQueryModel,
+      searchAcrossFolders,
+      searchQuery,
+      clearSearchHistory,
+      filteredResults,
+      triggerExpand,
+      formatGroupCount,
+      allSelectedAlerts,
+      copyToClipboard,
+      openMenu,
+      getAlertsFn,
+      multipleExportAlert,
+      computedOwner,
+      tabs,
+      alertTabs,
+      filterAlertsByTab,
+      showHistoryDrawer,
+      selectedHistoryAlertId,
+      selectedHistoryAlertName,
+      refreshImportedAlerts,
+      folderIdToBeCloned,
+      updateFolderIdToBeCloned,
+      transformToExpression,
+      filterAlertsByQuery,
+      bulkToggleAlerts,
+      openBulkDeleteDialog,
+      bulkDeleteAlerts,
+      confirmBulkDelete,
+      bulkDeleteLoading,
+      config,
+      isCompactToolbar,
+      isAnomalyDetectionEnabled,
+      refreshAlerts,
+      onAlertTabChange,
+      referenceDrawerOpen,
+      referenceAlertId,
+      referenceRows,
+      hiddenReferenceCount,
+      referenceConflictCode,
+      handleReferenceOpen,
+      navigateToReference,
+    };
+  },
+});
+</script>

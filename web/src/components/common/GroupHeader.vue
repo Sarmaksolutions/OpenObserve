@@ -1,0 +1,65 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <div class="flex items-center gap-2">
+    <img class="size-6" v-if="showIcon" :src="icon" :alt="t('components.groupHeader.icon')" />
+    <span data-test="common-group-header-title" class="text-base leading-6 font-bold">
+      {{ title }}
+    </span>
+    <span class="flex-1">
+      <OSeparator />
+    </span>
+  </div>
+</template>
+
+<script lang="ts">
+import { getImageURL } from "@/utils/zincutils";
+import { computed, defineComponent, type PropType } from "vue";
+import { useI18nTyped, raw, type I18nText } from "@/types/i18n";
+import OSeparator from "@/lib/core/Separator/OSeparator.vue";
+
+export default defineComponent({
+  name: "GroupHeader",
+  components: { OSeparator },
+  props: {
+    // Double cast is required: `StringConstructor` yields plain `string`, which
+    // does not overlap the branded `I18nText`. (`<script setup>` needs no cast.)
+    title: {
+      type: String as unknown as PropType<I18nText>,
+      default: raw(""),
+    },
+    iconPath: {
+      type: String,
+      default: "",
+    },
+    showIcon: {
+      type: Boolean,
+      default: true,
+    },
+  },
+  setup(props) {
+    const { t } = useI18nTyped();
+    const icon = computed(() => {
+      return getImageURL(props.iconPath);
+    });
+    return {
+      icon,
+      t,
+    };
+  },
+});
+</script>

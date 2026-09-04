@@ -1,0 +1,116 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <div class="border-card-glass-border border-b border-solid px-4 py-2">
+    <div class="flex flex-wrap items-center gap-3">
+      <span class="text-xs font-semibold opacity-70"> {{ filterLabelComputed }}: </span>
+      <div v-for="(value, key) in dimensions" :key="key" class="flex items-center gap-2">
+        <span
+          class="text-xs font-semibold"
+          :class="unstableDimensionKeys.has(key) ? 'opacity-60' : 'opacity-100'"
+        >
+          {{ key }}:
+        </span>
+        <OSelect
+          :model-value="value"
+          :options="getDimensionOptions(key, value)"
+          labelKey="label"
+          valueKey="value"
+          @update:model-value="(newValue) => handleDimensionChange(key, newValue as string)"
+          class="dimension-dropdown"
+          style="min-width: 7.5rem"
+          :data-test="`dimension-filter-${key}`"
+        />
+        <OTooltip
+          v-if="unstableDimensionKeys.has(key)"
+          :content="unstableDimensionTooltipComputed"
+          side="top"
+        />
+      </div>
+      <!-- Apply Button -->
+      <OButton
+        v-if="showApplyButton"
+        variant="outline"
+        size="sm-action"
+        :disabled="!hasPendingChanges"
+        @click="handleApply"
+        class="ms-2"
+        data-test="apply-dimension-filters"
+      >
+        {{ applyLabelComputed }}
+      </OButton>
+    </div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed } from "vue";
+import { useI18nTyped, type I18nText } from "@/types/i18n";
+import OButton from "@/lib/core/Button/OButton.vue";
+import OSelect from "@/lib/forms/Select/OSelect.vue";
+import OTooltip from "@/lib/overlay/Tooltip/OTooltip.vue";
+
+interface Props {
+  dimensions: Record<string, string>;
+  unstableDimensionKeys: Set<string>;
+  getDimensionOptions: (key: string, value: string) => Array<{ label: I18nText; value: string }>;
+  hasPendingChanges?: boolean;
+  showApplyButton?: boolean;
+  filterLabel?: I18nText;
+  applyLabel?: string;
+  unstableDimensionTooltip?: I18nText;
+}
+
+// Props
+const props = withDefaults(defineProps<Props>(), {
+  hasPendingChanges: false,
+  showApplyButton: true,
+  filterLabel: undefined,
+  applyLabel: undefined,
+  unstableDimensionTooltip: undefined,
+});
+
+// Emits
+const emit = defineEmits<{
+  "update:dimension": [payload: { key: string; value: string }];
+  apply: [];
+}>();
+
+// Composables
+const { t } = useI18nTyped();
+
+// Computed labels with fallbacks
+const filterLabelComputed = computed(() => props.filterLabel || t("correlation.filters"));
+const applyLabelComputed = computed(() => props.applyLabel || t("common.apply"));
+const unstableDimensionTooltipComputed = computed(
+  () => props.unstableDimensionTooltip || t("correlation.unstableDimensionTooltip"),
+);
+
+/**
+ * Handle dimension value change
+ */
+const handleDimensionChange = (key: string, value: string) => {
+  emit("update:dimension", { key, value });
+};
+
+/**
+ * Handle apply button click
+ */
+const handleApply = () => {
+  emit("apply");
+};
+</script>

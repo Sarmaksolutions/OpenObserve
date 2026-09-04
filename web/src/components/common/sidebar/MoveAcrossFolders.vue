@@ -1,0 +1,171 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <ODialog
+    data-test="move-across-folders-dialog"
+    :open="open"
+    size="md"
+    :title="
+      t('dashboard.moveToAnotherFolder', { type: type.charAt(0).toUpperCase() + type.slice(1) })
+    "
+    :secondary-button-label="t('dashboard.cancel')"
+    :primary-button-label="t('common.move')"
+    :primary-button-loading="onSubmit.isLoading.value"
+    :primary-button-disabled="!selectedFolder.value || activeFolderId === selectedFolder.value"
+    @update:open="emit('update:open', $event)"
+    @click:secondary="emit('update:open', false)"
+    @click:primary="onSubmit.execute()"
+  >
+    <div role="body" :data-test="`${type}-folder-move-body`">
+      <OInput
+        :model-value="
+          store.state.organizationData.foldersByType?.[type]?.find(
+            (item: any) => item.folderId === activeFolderId,
+          )?.name ?? ''
+        "
+        :label="t('dashboard.currentFolderLabel')"
+        disabled
+        :data-test="`${type}-folder-move-name`"
+      />
+      <span>&nbsp;</span>
+
+      <!-- select folder or create new folder and select.
+
+           `excludeFolderId` is what stops the destination opening on the folder
+           named directly above it as the CURRENT one: the same folder appeared
+           twice, reading as "move this to where it already is". Submit was
+           disabled in that state, so nothing could go wrong — the dialog simply
+           gave no clue why. -->
+      <SelectFolderDropDown
+        :type="type"
+        @folder-selected="selectedFolder = $event"
+        :activeFolderId="activeFolderId"
+        :excludeFolderId="activeFolderId"
+      />
+    </div>
+  </ODialog>
+</template>
+
+<script lang="ts">
+import { defineComponent, ref } from "vue";
+import { useI18nTyped } from "@/types/i18n";
+import { useStore } from "vuex";
+import { getImageURL } from "@/utils/zincutils";
+import { moveModuleToAnotherFolder } from "@/utils/commons";
+import { useLoading } from "@/composables/useLoading";
+import useNotifications from "@/composables/useNotifications";
+import SelectFolderDropDown from "./SelectFolderDropDown.vue";
+import ODialog from "@/lib/overlay/Dialog/ODialog.vue";
+import OInput from "@/lib/forms/Input/OInput.vue";
+
+export default defineComponent({
+  name: "MoveAcrossFolders",
+  components: { SelectFolderDropDown, ODialog, OInput },
+  props: {
+    activeFolderId: {
+      type: String,
+      default: "default",
+    },
+    moduleId: {
+      type: Array,
+      default: () => [],
+    },
+    anomalyConfigIds: {
+      type: Array,
+      default: () => [],
+    },
+    type: {
+      type: String,
+      default: "alerts",
+    },
+    open: {
+      type: Boolean,
+      default: false,
+    },
+  },
+  emits: ["updated", "close", "update:open"],
+  setup(props, { emit }) {
+    const store: any = useStore();
+    // Dropdown selected folder — deliberately empty, not the active folder.
+    // The picker excludes the active folder, so seeding it here would name a
+    // destination the list cannot offer and cannot be re-picked.
+    const selectedFolder = ref({ label: "", value: "" });
+    const { t } = useI18nTyped();
+    const { showPositiveNotification, showErrorNotification } = useNotifications();
+
+    const onSubmit = useLoading(async () => {
+      try {
+        const moduleIds = props.moduleId;
+        const data: Record<string, any> = {
+          [getModuleName()]: moduleIds,
+          dst_folder_id: selectedFolder.value.value,
+        };
+        if (props.anomalyConfigIds && (props.anomalyConfigIds as any[]).length > 0) {
+          data.anomaly_config_ids = props.anomalyConfigIds;
+        }
+        await moveModuleToAnotherFolder(store, data, props.type, props.activeFolderId);
+
+        showPositiveNotification(
+          t("toastMessages.sidebar.movedSuccessfully", {
+            type: props?.type?.charAt?.(0)?.toUpperCase() + props?.type?.slice?.(1),
+          }),
+          {
+            timeout: 5000,
+          },
+        );
+
+        emit("updated", props.activeFolderId, selectedFolder.value.value);
+      } catch (err: any) {
+        showErrorNotification(
+          err?.message ??
+            t("toastMessages.sidebar.moveFailed", {
+              type: props?.type?.charAt?.(0)?.toUpperCase() + props?.type?.slice?.(1),
+            }),
+          {
+            timeout: 5000,
+          },
+        );
+      }
+    });
+    //this will be used to get the module name based on the type
+    const getModuleName = () => {
+      switch (props.type) {
+        case "alerts":
+          return "alert_ids";
+        case "pipelines":
+          return "pipeline_ids";
+        case "reports":
+          return "report_ids";
+        case "synthetics":
+          return "synthetic_ids";
+        default:
+          return "alert_ids";
+      }
+    };
+
+    return {
+      t,
+      store,
+      getImageURL,
+      selectedFolder,
+      onSubmit,
+      getModuleName,
+      emit,
+    };
+  },
+});
+</script>

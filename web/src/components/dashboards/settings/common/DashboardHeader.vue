@@ -1,0 +1,75 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <div data-test="dashboard-header-root">
+    <div data-test="dashboard-header-row" class="mx-2 my-2 flex flex-nowrap items-center">
+      <div v-if="backButton" data-test="dashboard-header-back-button-container" class="col-auto">
+        <OButton
+          data-test="dashboard-header-back-button"
+          variant="outline"
+          size="icon-xs"
+          class="me-2"
+          @click="onBackClicked"
+          icon-left="arrow-back-ios-new"
+        >
+        </OButton>
+      </div>
+      <div data-test="dashboard-header-title-container" class="flex flex-1 flex-col">
+        <div data-test="dashboard-header-title" class="text-base font-semibold">
+          {{ title }}
+        </div>
+      </div>
+      <div data-test="dashboard-header-right-slot-container" class="col-auto">
+        <slot name="right"></slot>
+      </div>
+    </div>
+    <OSeparator data-test="dashboard-header-separator" />
+  </div>
+</template>
+
+<script lang="ts">
+import { raw, type I18nText } from "@/types/i18n";
+import { defineComponent, type PropType } from "vue";
+import OButton from "@/lib/core/Button/OButton.vue";
+import OSeparator from "@/lib/core/Separator/OSeparator.vue";
+
+export default defineComponent({
+  name: "DashboardHeader",
+  components: { OSeparator, OButton },
+  props: {
+    title: {
+      type: String as unknown as PropType<I18nText>,
+      default: raw(""),
+    },
+    backButton: {
+      type: Boolean,
+      default: false,
+    },
+  },
+  emits: ["back"],
+  setup(props, { emit }) {
+    const onBackClicked = () => {
+      emit("back");
+    };
+
+    return {
+      raw,
+      onBackClicked,
+    };
+  },
+});
+</script>

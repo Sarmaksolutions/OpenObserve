@@ -1,0 +1,76 @@
+# ---------- OS / editor ----------
+.DS_Store
+.history
+/.idea/
+.vscode/
+
+# ---------- node / web ----------
+node_modules/
+.vite/
+.vitest/
+/web/dist
+/web/.env
+
+# ---------- cargo build output ----------
+/target/
+/bin/
+/examples/
+/docs/
+
+# ---------- env files ----------
+/.env*
+
+# ---------- runtime data ----------
+/tmp/
+/data*/
+/src/*/data/
+# Runtime SQLite artifacts. A local run started inside a crate directory writes
+# these into that crate's data dir, which `/src/*/data/` does not match once the
+# crate is nested (e.g. src/api/common/data/). Ignoring by extension is precise:
+# no SQLite file in this repo is source.
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# ---------- local scratch / verification artifacts ----------
+report.json
+flamegraph.svg
+flamegraph.html
+*.bak
+.mcp.json
+/download/
+
+# ---------- test artifacts ----------
+/test-logs
+/test-results/
+/test-assist-results/
+**/debug-login-page.png
+/.playwright-mcp
+/tests/bug-automation
+/tests/test-data/correlation-data
+/tests/ux-audit/*.worktrees/
+tests/playwright_mcp/
+/tests/ui-testing/test-logs
+/tests/ui-testing/test-archives
+/tests/ui-testing/test-output/
+/tests/ui-testing/playwright-results
+/tests/ui-testing/testDinoPOC
+/tests/ui-testing/MD_Files
+/tests/ui-testing/metrics-ingestion
+/tests/ui-testing/utils/test-mapping/archived-utils
+/tests/ui-testing/playwright-tests/envRunsMDFiles
+tests/ui-testing/playwright-tests/utils/auth/user.json
+
+# ---------- OpenCode ----------
+# Only agents/ is tracked (CI workflows need it); everything else is ignored.
+/.opencode/*
+!/.opencode/agents/
+
+# ---------- other agents ----------
+/.agents/*
+
+# ---------- Claude Code ----------
+/.claude/settings.json
+/.claude/settings.local.json
+/.claude/worktrees/
+.screenshots/

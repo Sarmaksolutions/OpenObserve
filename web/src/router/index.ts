@@ -1,0 +1,145 @@
+// Copyright 2026 OpenObserve Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import { createRouter, createWebHistory } from "vue-router";
+import { getDecodedUserInfo, getPath, mergeRoutes } from "@/utils/zincutils";
+import { gt } from "@/types/i18n";
+import segment from "@/services/segment_analytics";
+import config from "@/aws-exports";
+
+import userCloudRoutes from "@/enterprise/composables/router";
+import userRoutes from "@/composables/shared/router";
+import useOSRoutes from "@/composables/router";
+
+export default function (store: any) {
+  let { parentRoutes, homeChildRoutes } = userRoutes();
+
+  let envRoutes: any;
+  if (config.isCloud == "true" || config.isEnterprise == "true") {
+    envRoutes = userCloudRoutes();
+  } else {
+    envRoutes = useOSRoutes();
+  }
+
+  // parentRoutes = parentRoutes.concat(envRoutes.parentRoutes);
+  // homeChildRoutes = homeChildRoutes.concat(envRoutes.homeChildRoutes);
+  parentRoutes = mergeRoutes(parentRoutes, envRoutes.parentRoutes);
+  homeChildRoutes = mergeRoutes(homeChildRoutes, envRoutes.homeChildRoutes);
+
+  // Merge enterprise pipeline children (eval templates, etc.) as direct children of pipeline
+  if (envRoutes.pipelineChildren) {
+    const pipelineRoute = homeChildRoutes.find((r: any) => r.path === "pipeline");
+    if (pipelineRoute) {
+      pipelineRoute.children = mergeRoutes(
+        pipelineRoute.children || [],
+        envRoutes.pipelineChildren,
+      );
+    }
+  }
+
+  // Filter out catchall route from homeChildRoutes
+  const catchAllRoute = homeChildRoutes.find((r: any) => r.path === "/:catchAll(.*)*");
+  const nonCatchAllRoutes = homeChildRoutes.filter((r: any) => r.path !== "/:catchAll(.*)*");
+
+  const routes = [
+    ...parentRoutes,
+    {
+      path: "/",
+      component: () => import("@/layouts/MainLayout.vue"),
+      children: [...nonCatchAllRoutes],
+    },
+    // Add catchall at the end to match any unmatched routes
+    ...(catchAllRoute ? [catchAllRoute] : []),
+  ];
+
+  interface RouterMap {
+    history: any;
+    routes: any;
+  }
+  const routerMap: RouterMap = {
+    history: createWebHistory(getPath()),
+    // history: createWebHistory(window.location.pathname),
+    routes: routes,
+  };
+
+  const router = createRouter(routerMap);
+
+  router.beforeEach((to: any, from: any, next: any) => {
+    // Set page title with OpenObserve prefix.
+    //
+    // Routes carry an i18n KEY (`meta.titleKey`), not the text: the route tables
+    // are module-scope, so translating where a route is declared would freeze the
+    // tab title at whatever locale happened to be active at import time. Resolving
+    // here — per navigation — keeps it in the current locale. `gt` (not `t`)
+    // because a navigation guard runs outside any component setup.
+    if (to.meta && to.meta.titleKey) {
+      // The brand prefix is a product noun, never translated; the page name is.
+      document.title = `OpenObserve - ${gt(to.meta.titleKey)}`;
+    } else {
+      document.title = "OpenObserve";
+    }
+
+    const isAuthenticated = store.state.loggedIn;
+
+    if (
+      !isAuthenticated &&
+      (to.path === "/cb" ||
+        to.path === "/web/cb" ||
+        to.path === "/slack/oauth/callback" ||
+        to.path === "/web/slack/oauth/callback")
+    ) {
+      next();
+    } else if (!isAuthenticated) {
+      const sessionUserInfo = getDecodedUserInfo();
+
+      if (
+        to.path !== "/login" &&
+        to.path !== "/cb" &&
+        to.path != "/web/cb" &&
+        sessionUserInfo === null
+      ) {
+        if (to.path !== "/logout" && to.path !== "/cb" && to.path != "/web/cb") {
+          // If query params contain short_url, store that URL; else store the
+          // current URL. Needed for the short URL feature: after login the user
+          // is redirected to the stored short URL.
+          if (Object.hasOwn(to.query, "short_url")) {
+            window.sessionStorage.setItem("redirectURI", to.query.short_url);
+          } else {
+            window.sessionStorage.setItem("redirectURI", window.location.href);
+          }
+        }
+        next({ path: "/login" });
+      } else {
+        if (sessionUserInfo !== null) {
+          const userInfo = JSON.parse(String(sessionUserInfo));
+          store.dispatch("login", {
+            loginState: true,
+            userInfo: userInfo,
+          });
+        }
+        next();
+      }
+    } else {
+      getDecodedUserInfo();
+
+      segment.track("page view", {
+        path: to.path,
+        referrer: from.path,
+      });
+      next();
+    }
+  });
+  return router;
+}

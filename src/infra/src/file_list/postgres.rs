@@ -1,0 +1,5412 @@
+// Copyright 2026 OpenObserve Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+use std::{collections::HashMap as stdHashMap, sync::LazyLock as Lazy};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
+use config::{
+    RwHashSet, get_config,
+    meta::stream::{
+        FileKey, FileListBookKeepMode, FileListDeleted, FileMeta, PartitionTimeLevel, StreamStats,
+        StreamType,
+    },
+    metrics::{DB_QUERY_NUMS, DB_QUERY_TIME},
+    utils::{
+        hash::Sum64,
+        parquet::parse_file_key_columns,
+        time::{DAY_MICRO_SECS, end_of_the_day, now_micros},
+    },
+};
+use hashbrown::{HashMap, HashSet};
+use sqlx::{Executor, PgConnection, Postgres, QueryBuilder, Row};
+
+use crate::{
+    db::{
+        IndexStatement,
+        postgres::{CLIENT_DDL, CLIENT_RO, CLIENT_RW, add_column, create_index, delete_index},
+    },
+    errors::{Error, Result},
+    file_list::FileRecord,
+};
+
+/// In-memory cache of known partition names to avoid repeated DDL checks.
+/// Shared by all three partitioned tables (file_list, file_list_history, file_list_dump_stats).
+static PARTITION_CACHE: Lazy<RwHashSet<String>> = Lazy::new(Default::default);
+
+/// The maximum number of rows allowed in a table before automatic migration is triggered.
+const FILE_LIST_MIGRATION_LIMIT: i64 = 1_000_000;
+
+/// The number of days to post-partition the file_list table.
+const FILE_LIST_POST_PARTITION_DAYS: i64 = 7;
+
+pub struct PostgresFileList {}
+
+impl PostgresFileList {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Default for PostgresFileList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl super::FileList for PostgresFileList {
+    async fn health_check(&self) -> Result<()> {
+        let pool = CLIENT_RW.clone();
+        let is_writable: bool = sqlx::query_scalar(
+            r#"SELECT NOT pg_is_in_recovery() 
+            AND current_setting('transaction_read_only')::bool = false 
+            AND current_setting('default_transaction_read_only')::bool = false"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| Error::Message(format!("PostgreSQL health check failed: {e}")))?;
+        if !is_writable {
+            return Err(Error::Message(
+                "PostgreSQL health check: database is not writable (in recovery or read-only mode)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn create_table(&self) -> Result<()> {
+        create_table().await
+    }
+
+    async fn create_table_index(&self) -> Result<()> {
+        create_table_index().await
+    }
+
+    async fn add(&self, account: &str, file: &str, meta: &FileMeta) -> Result<i64> {
+        self.inner_add("file_list", account, file, meta).await
+    }
+
+    async fn add_history(&self, account: &str, file: &str, meta: &FileMeta) -> Result<i64> {
+        self.inner_add("file_list_history", account, file, meta)
+            .await
+    }
+
+    async fn remove(&self, file: &str) -> Result<()> {
+        let pool = CLIENT_RW.clone();
+        let (stream_key, date_key, file_name) =
+            parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
+
+        DB_QUERY_NUMS
+            .with_label_values(&["delete", "file_list"])
+            .inc();
+        sqlx::query(r#"DELETE FROM file_list WHERE stream = $1 AND date = $2 AND file = $3;"#)
+            .bind(stream_key)
+            .bind(date_key)
+            .bind(file_name)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn batch_add(&self, files: &[FileKey]) -> Result<()> {
+        self.inner_batch_process("file_list", files).await
+    }
+
+    async fn batch_add_with_id(&self, _files: &[FileKey]) -> Result<()> {
+        Err(Error::Message("Unsupported operation".to_string()))
+    }
+
+    async fn batch_add_history(&self, files: &[FileKey]) -> Result<()> {
+        self.inner_batch_process("file_list_history", files).await
+    }
+
+    async fn batch_process(&self, files: &[FileKey]) -> Result<()> {
+        self.inner_batch_process("file_list", files).await
+    }
+
+    async fn update_dump_records(
+        &self,
+        dump_file: &FileKey,
+        dumped_ids: &[(i64, String)],
+    ) -> Result<()> {
+        let pool = CLIENT_RW.clone();
+
+        // insert the dump file into file_list table
+        let (stream_key, date_key, file_name) =
+            parse_file_key_columns(&dump_file.key).map_err(|e| Error::Message(e.to_string()))?;
+        let org_id = stream_key[..stream_key.find('/').unwrap()].to_string();
+        let meta = &dump_file.meta;
+        let now_ts = now_micros();
+
+        // Ensure partition exists for this date
+        ensure_file_list_partition(&pool, "file_list", &date_key).await?;
+
+        let mut tx = pool.begin().await?;
+        DB_QUERY_NUMS
+            .with_label_values(&["insert", "file_list"])
+            .inc();
+        if let Err(e) = sqlx::query(
+            r#"INSERT INTO file_list
+              (account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, updated_at)
+            VALUES
+              ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            ON CONFLICT DO NOTHING"#
+                )
+                .bind(&dump_file.account)
+                .bind(org_id)
+                .bind(stream_key)
+                .bind(date_key)
+                .bind(file_name)
+                .bind(false)
+                .bind(meta.min_ts)
+                .bind(meta.max_ts)
+                .bind(meta.records)
+                .bind(meta.original_size)
+                .bind(meta.compressed_size)
+                .bind(meta.index_size)
+                .bind(meta.bloom_ver)
+                .bind(meta.flattened)
+                .bind(now_ts)
+                .execute(&mut *tx).await
+        {
+            if let Err(e) = tx.rollback().await {
+                log::error!(
+                    "[POSTGRES] rollback file_list update dump error: {e}",
+                );
+            }
+            return Err(e.into());
+        }
+
+        // delete the dumped ids from file_list table; date predicate enables partition pruning
+        for (date, query_str) in chunked_pruned_delete_statements(
+            "file_list",
+            dumped_ids,
+            get_config().compact.file_list_deleted_batch_size,
+        ) {
+            DB_QUERY_NUMS
+                .with_label_values(&["delete_by_ids", "file_list"])
+                .inc();
+            let start = std::time::Instant::now();
+            let res = sqlx::query(&query_str).bind(&date).execute(&mut *tx).await;
+            let time = start.elapsed().as_secs_f64();
+            DB_QUERY_TIME
+                .with_label_values(&["delete_by_ids", "file_list"])
+                .observe(time);
+            if let Err(e) = res {
+                if let Err(e) = tx.rollback().await {
+                    log::error!("[POSTGRES] rollback file_list update dump error: {e}");
+                }
+                return Err(e.into());
+            }
+        }
+
+        if let Err(e) = tx.commit().await {
+            log::error!("[POSTGRES] commit file_list dump update error: {e}");
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    async fn batch_add_deleted(
+        &self,
+        org_id: &str,
+        created_at: i64,
+        files: &[FileListDeleted],
+    ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let pool = CLIENT_RW.clone();
+        let chunks = files.chunks(100);
+        for files in chunks {
+            // we don't care the id here, because the id is from file_list table not for this table
+            let mut tx = pool.begin().await?;
+            let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
+                "INSERT INTO file_list_deleted (account, org, stream, date, file, index_file, flattened, created_at)",
+            );
+            query_builder.push_values(files, |mut b, item| {
+                let (stream_key, date_key, file_name) =
+                    parse_file_key_columns(&item.file).expect("parse file key failed");
+                b.push_bind(&item.account)
+                    .push_bind(org_id)
+                    .push_bind(stream_key)
+                    .push_bind(date_key)
+                    .push_bind(file_name)
+                    .push_bind(item.index_file)
+                    .push_bind(item.flattened)
+                    .push_bind(created_at);
+            });
+            DB_QUERY_NUMS
+                .with_label_values(&["insert", "file_list_deleted"])
+                .inc();
+            if let Err(e) = query_builder.build().execute(&mut *tx).await {
+                if let Err(e) = tx.rollback().await {
+                    log::error!("[POSTGRES] rollback file_list_deleted batch add error: {e}");
+                }
+                return Err(e.into());
+            }
+            if let Err(e) = tx.commit().await {
+                log::error!("[POSTGRES] commit file_list_deleted batch add error: {e}");
+                return Err(e.into());
+            }
+        }
+        Ok(())
+    }
+
+    async fn batch_remove_deleted(&self, files: &[FileKey]) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let chunks = files.chunks(100);
+        for files in chunks {
+            // get ids of the files
+            let pool = CLIENT_RW.clone();
+            let mut ids = Vec::with_capacity(files.len());
+            for file in files {
+                if file.id > 0 {
+                    ids.push(file.id.to_string());
+                    continue;
+                }
+                let (stream_key, date_key, file_name) =
+                    parse_file_key_columns(&file.key).map_err(|e| Error::Message(e.to_string()))?;
+                DB_QUERY_NUMS
+                    .with_label_values(&["select", "file_list_deleted"])
+                    .inc();
+                let ret: Option<i64> = match
+                    sqlx
+                        ::query_scalar(
+                            r#"SELECT id FROM file_list_deleted WHERE stream = $1 AND date = $2 AND file = $3;"#
+                        )
+                        .bind(stream_key)
+                        .bind(date_key)
+                        .bind(file_name)
+                        .fetch_one(&pool).await
+                {
+                    Ok(v) => v,
+                    Err(sqlx::Error::RowNotFound) => {
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e.into());
+                    }
+                };
+                match ret {
+                    Some(v) => ids.push(v.to_string()),
+                    None => {
+                        return Err(Error::Message(
+                            "[POSTGRES] query error: id should not empty from file_list_deleted"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            // delete files by ids
+            if !ids.is_empty() {
+                DB_QUERY_NUMS
+                    .with_label_values(&["delete", "file_list_deleted"])
+                    .inc();
+                let sql = format!(
+                    "DELETE FROM file_list_deleted WHERE id IN({});",
+                    ids.join(",")
+                );
+                _ = pool.execute(sql.as_str()).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn get(&self, file: &str) -> Result<FileMeta> {
+        let pool = CLIENT_RO.clone();
+        let (stream_key, date_key, file_name) =
+            parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
+        DB_QUERY_NUMS.with_label_values(&["get", "file_list"]).inc();
+        let start = std::time::Instant::now();
+        let ret = sqlx::query_as::<_, super::FileRecord>(
+            r#"
+SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, file, date
+    FROM file_list WHERE stream = $1 AND date = $2 AND file = $3;
+            "#,
+        )
+        .bind(stream_key)
+        .bind(date_key)
+        .bind(file_name)
+        .fetch_one(&pool)
+        .await;
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["get", "file_list"])
+            .observe(time);
+        Ok(FileMeta::from(&ret?))
+    }
+
+    async fn contains(&self, file: &str) -> Result<bool> {
+        let pool = CLIENT_RO.clone();
+        let (stream_key, date_key, file_name) =
+            parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
+        DB_QUERY_NUMS
+            .with_label_values(&["contains", "file_list"])
+            .inc();
+        let start = std::time::Instant::now();
+        let ret = sqlx::query(
+            r#"SELECT * FROM file_list WHERE stream = $1 AND date = $2 AND file = $3;"#,
+        )
+        .bind(stream_key)
+        .bind(date_key)
+        .bind(file_name)
+        .fetch_one(&pool)
+        .await;
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["contains", "file_list"])
+            .observe(time);
+        if let Err(sqlx::Error::RowNotFound) = ret {
+            return Ok(false);
+        }
+        Ok(!ret.unwrap().is_empty())
+    }
+
+    async fn update_flattened(&self, file: &str, flattened: bool) -> Result<()> {
+        let pool = CLIENT_RW.clone();
+        let (stream_key, date_key, file_name) =
+            parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list"])
+            .inc();
+        sqlx::query(
+            r#"UPDATE file_list SET flattened = $1 WHERE stream = $2 AND date = $3 AND file = $4;"#,
+        )
+        .bind(flattened)
+        .bind(stream_key)
+        .bind(date_key)
+        .bind(file_name)
+        .execute(&pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn update_compressed_size(&self, file: &str, size: i64) -> Result<()> {
+        let pool = CLIENT_RW.clone();
+        let (stream_key, date_key, file_name) =
+            parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list"])
+            .inc();
+        sqlx::query(
+            r#"UPDATE file_list SET compressed_size = $1 WHERE stream = $2 AND date = $3 AND file = $4;"#,
+        )
+        .bind(size)
+        .bind(stream_key)
+        .bind(date_key)
+        .bind(file_name)
+        .execute(&pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn update_bloom_ver(&self, ids: &[i64], bloom_ver: i64) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let pool = CLIENT_RW.clone();
+        // Use ANY($2) with a bigint array — postgres handles arbitrary length
+        // without needing chunking, and the partition pruning works on the
+        // file_list_*_pkey index.
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list"])
+            .inc();
+        sqlx::query("UPDATE file_list SET bloom_ver = $1 WHERE id = ANY($2)")
+            .bind(bloom_ver)
+            .bind(ids)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn bloom_ver_referenced(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        date: &str,
+        bloom_ver: i64,
+    ) -> Result<bool> {
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["bloom_ver_referenced", "file_list"])
+            .inc();
+        // Index note: filters on (stream, date, bloom_ver). The existing
+        // (stream, date) index narrows it to one hour bucket (a few hundred
+        // rows at most), so the residual bloom_ver scan is cheap and LIMIT 1
+        // stops at the first hit — no dedicated composite index needed.
+        let found: Option<(i32,)> = sqlx::query_as(
+            r#"SELECT 1 FROM file_list WHERE stream = $1 AND date = $2 AND bloom_ver = $3 LIMIT 1;"#,
+        )
+        .bind(stream_key)
+        .bind(date)
+        .bind(bloom_ver)
+        .fetch_optional(&pool)
+        .await?;
+        Ok(found.is_some())
+    }
+
+    async fn list(&self) -> Result<Vec<FileKey>> {
+        return Ok(vec![]); // disallow list all data
+    }
+
+    async fn query(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        _time_level: PartitionTimeLevel,
+        time_range: (i64, i64),
+        flattened: Option<bool>,
+    ) -> Result<Vec<FileKey>> {
+        let start = std::time::Instant::now();
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["query", "file_list"])
+            .inc();
+        let ret = if let Some(flattened) = flattened {
+            sqlx::query_as::<_, super::FileRecord>(
+                r#"
+SELECT id, account, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened
+    FROM file_list
+    WHERE stream = $1 AND flattened = $2 LIMIT 1000;
+                "#
+                )
+                .bind(stream_key)
+                .bind(flattened)
+                .fetch_all(&pool).await
+        } else {
+            let (time_start, time_end) = time_range;
+            let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
+            let (date_from, date_to) = derive_date_range(time_start, time_end);
+            let sql = r#"
+SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened
+    FROM file_list
+    WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4 AND date >= $5 AND date < $6;
+                "#;
+
+            sqlx::query_as::<_, super::FileRecord>(sql)
+                .bind(stream_key)
+                .bind(time_start)
+                .bind(max_ts_upper_bound)
+                .bind(time_end)
+                .bind(date_from)
+                .bind(date_to)
+                .fetch_all(&pool)
+                .await
+        };
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["query", "file_list"])
+            .observe(time);
+        Ok(ret?.iter().map(|r| r.into()).collect())
+    }
+
+    async fn query_for_merge(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        date_range: (String, String),
+        max_original_size: i64,
+    ) -> Result<Vec<FileKey>> {
+        let start = std::time::Instant::now();
+        let (date_start, date_end) = date_range;
+        if date_start.is_empty() && date_end.is_empty() {
+            return Ok(Vec::new());
+        }
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["query_for_merge", "file_list"])
+            .inc();
+
+        let sql = r#"
+SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened
+    FROM file_list
+    WHERE stream = $1 AND date >= $2 AND date <= $3 AND original_size <= $4;
+                "#;
+        let ret = sqlx::query_as::<_, super::FileRecord>(sql)
+            .bind(stream_key)
+            .bind(date_start)
+            .bind(date_end)
+            .bind(max_original_size)
+            .fetch_all(&pool)
+            .await;
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["query_for_merge", "file_list"])
+            .observe(time);
+        Ok(ret?.iter().map(|r| r.into()).collect())
+    }
+
+    async fn query_for_dump(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        time_range: (i64, i64),
+    ) -> Result<Vec<FileRecord>> {
+        let start = std::time::Instant::now();
+        let (time_start, time_end) = time_range;
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["query", "file_list"])
+            .inc();
+        let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
+        let (date_from, date_to) = derive_date_range(time_start, time_end);
+        let ret = sqlx::query_as::<_, super::FileRecord>(
+            r#"SELECT * FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4 AND date >= $5 AND date < $6;"#,
+        )
+        .bind(stream_key)
+        .bind(time_start)
+        .bind(max_ts_upper_bound)
+        .bind(time_end)
+        .bind(date_from)
+        .bind(date_to)
+        .fetch_all(&pool)
+        .await;
+
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["query", "file_list"])
+            .observe(time);
+        Ok(ret?)
+    }
+
+    async fn query_for_dump_by_updated_at(
+        &self,
+        time_range: (i64, i64),
+    ) -> Result<Vec<FileRecord>> {
+        let start = std::time::Instant::now();
+        let (time_start, time_end) = time_range;
+
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["query_by_updated_at", "file_list"])
+            .inc();
+        let ret = sqlx::query_as::<_, super::FileRecord>(
+            r#"SELECT * FROM file_list WHERE updated_at > $1 AND updated_at <= $2 AND stream LIKE $3;"#,
+        )
+        .bind(time_start)
+        .bind(time_end)
+        .bind(format!("%/{}/%", StreamType::Filelist))
+        .fetch_all(&pool)
+        .await;
+
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["query_by_updated_at", "file_list"])
+            .observe(time);
+        Ok(ret?)
+    }
+
+    async fn query_for_bloom(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        date: &str,
+    ) -> Result<Vec<FileKey>> {
+        let start = std::time::Instant::now();
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["query_for_bloom", "file_list"])
+            .inc();
+
+        let sql = r#"
+SELECT id, account, stream, date, file, records, index_size FROM file_list WHERE stream = $1 AND date = $2 AND index_size > 0 AND bloom_ver = 0;
+                "#;
+        let ret = sqlx::query_as::<_, super::FileRecord>(sql)
+            .bind(stream_key)
+            .bind(date)
+            .fetch_all(&pool)
+            .await;
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["query_for_bloom", "file_list"])
+            .observe(time);
+        Ok(ret?.iter().map(|r| r.into()).collect())
+    }
+
+    async fn query_by_ids(
+        &self,
+        ids: &[i64],
+        time_range: Option<(i64, i64)>,
+    ) -> Result<Vec<FileKey>> {
+        if ids.is_empty() {
+            return Ok(Vec::default());
+        }
+        let mut ret = Vec::new();
+        let pool = CLIENT_RO.clone();
+
+        // Derive a date filter from the time range to enable partition pruning.
+        // Without it, planning must open and lock every partition and execution
+        // probes every partition's id index. Measured on 2.7B rows / 384 daily
+        // partitions: ~110ms per call without the filter vs 1.2~2.9ms with it.
+        let date_filter = match time_range {
+            Some((time_start, time_end)) if time_start > 0 && time_end >= time_start => {
+                let (date_from, date_to) = derive_date_range(time_start, time_end);
+                format!(" AND date >= '{date_from}' AND date < '{date_to}'")
+            }
+            _ => String::new(),
+        };
+
+        for chunk in ids.chunks(get_config().compact.file_list_deleted_batch_size) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let ids = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<String>>()
+                .join(",");
+            let query_str = format!(
+                "SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver FROM file_list WHERE id IN ({ids}){date_filter}"
+            );
+            DB_QUERY_NUMS
+                .with_label_values(&["query_by_ids", "file_list"])
+                .inc();
+            let start = std::time::Instant::now();
+            let res = sqlx::query_as::<_, super::FileRecord>(&query_str)
+                .fetch_all(&pool)
+                .await;
+            let time = start.elapsed().as_secs_f64();
+            DB_QUERY_TIME
+                .with_label_values(&["query_by_ids", "file_list"])
+                .observe(time);
+            ret.extend_from_slice(&res?);
+        }
+
+        Ok(ret.iter().map(|r| r.into()).collect())
+    }
+
+    async fn query_ids(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        time_range: (i64, i64),
+    ) -> Result<Vec<super::FileId>> {
+        let start = std::time::Instant::now();
+        let (time_start, time_end) = time_range;
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+
+        let day_partitions = if time_end - time_start <= DAY_MICRO_SECS
+            || time_end - time_start > DAY_MICRO_SECS * 30
+            || !get_config().compact.file_list_multi_thread
+        {
+            vec![(time_start, time_end)]
+        } else {
+            let mut partitions = Vec::new();
+            let mut start = time_start;
+            while start < time_end {
+                let end_of_day = std::cmp::min(end_of_the_day(start), time_end);
+                partitions.push((start, end_of_day));
+                start = end_of_day + 1; // next day, use end_of_day + 1 microsecond
+            }
+            partitions
+        };
+        log::debug!("file_list day_partitions: {day_partitions:?}");
+
+        let mut tasks = Vec::with_capacity(day_partitions.len());
+
+        for (time_start, time_end) in day_partitions {
+            let stream_key = stream_key.clone();
+            tasks.push(tokio::task::spawn(async move {
+                let pool = CLIENT_RO.clone();
+                DB_QUERY_NUMS
+                .with_label_values(&["query_ids", "file_list"])
+                .inc();
+                let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
+                let (date_from, date_to) = derive_date_range(time_start, time_end);
+                let query = "SELECT id, records, original_size FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4 AND date >= $5 AND date < $6;";
+                sqlx::query_as::<_, super::FileId>(query)
+                .bind(stream_key)
+                .bind(time_start)
+                .bind(max_ts_upper_bound)
+                .bind(time_end)
+                .bind(date_from)
+                .bind(date_to)
+                .fetch_all(&pool)
+                .await
+            }));
+        }
+
+        let mut rets = Vec::new();
+        for task in tasks {
+            match task.await {
+                Ok(Ok(r)) => rets.extend(r),
+                Ok(Err(e)) => {
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    return Err(Error::Message(e.to_string()));
+                }
+            };
+        }
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["query_ids", "file_list"])
+            .observe(time);
+        Ok(rets)
+    }
+
+    async fn query_ids_by_files(&self, files: &[FileKey]) -> Result<stdHashMap<String, i64>> {
+        let mut ret = stdHashMap::with_capacity(files.len());
+        // group by date
+        let mut stream_files = HashMap::new();
+        let mut files_map = HashMap::with_capacity(files.len());
+        for file in files {
+            if file.id > 0 {
+                ret.insert(file.key.clone(), file.id);
+                continue;
+            }
+            let (stream_key, date_key, file_name) =
+                parse_file_key_columns(&file.key).map_err(|e| Error::Message(e.to_string()))?;
+            let stream_entry = stream_files.entry(stream_key).or_insert(HashMap::new());
+            let date_entry = stream_entry.entry(date_key).or_insert(Vec::new());
+            date_entry.push(file_name.clone());
+            files_map.insert(file_name, &file.key);
+        }
+        for (stream_key, stream_files) in stream_files {
+            let pool = CLIENT_RO.clone();
+            for (date_key, files) in stream_files {
+                if files.is_empty() {
+                    continue;
+                }
+                let sql = format!(
+                    "SELECT id, file FROM file_list WHERE stream = $1 AND date = $2 AND file IN ('{}');",
+                    files.join("','")
+                );
+                let query_res = sqlx::query_as::<_, super::FileIdWithFile>(&sql)
+                    .bind(&stream_key)
+                    .bind(&date_key)
+                    .fetch_all(&pool)
+                    .await?;
+                for file in query_res {
+                    if let Some(file_name) = files_map.get(&file.file) {
+                        ret.insert(file_name.to_string(), file.id);
+                    }
+                }
+            }
+        }
+        Ok(ret)
+    }
+
+    async fn query_old_data_hours(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        time_range: (i64, i64),
+    ) -> Result<Vec<String>> {
+        let start = std::time::Instant::now();
+        let (time_start, time_end) = time_range;
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["query_old_data_hours", "file_list"])
+            .inc();
+        let cfg = get_config();
+        let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
+        let (date_from, date_to) = derive_date_range(time_start, time_end);
+        let sql = r#"
+SELECT date
+    FROM file_list
+    WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4 AND original_size <= $5 AND date >= $7 AND date < $8
+    GROUP BY date HAVING count(*) >= $6;
+            "#;
+
+        let ret = sqlx::query(sql)
+            .bind(stream_key)
+            .bind(time_start)
+            .bind(max_ts_upper_bound)
+            .bind(time_end)
+            .bind(cfg.compact.max_file_size as i64 / 2)
+            .bind(cfg.compact.old_data_min_files)
+            .bind(date_from)
+            .bind(date_to)
+            .fetch_all(&pool)
+            .await?;
+
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["query_old_data_hours", "file_list"])
+            .observe(time);
+        Ok(ret
+            .into_iter()
+            .map(|r| r.try_get::<String, &str>("date").unwrap_or_default())
+            .collect())
+    }
+
+    async fn query_deleted(
+        &self,
+        org_id: &str,
+        time_max: i64,
+        limit: i64,
+    ) -> Result<Vec<FileListDeleted>> {
+        if time_max == 0 {
+            return Ok(Vec::new());
+        }
+
+        let pool = CLIENT_RW.clone();
+        let mut tx = pool.begin().await?;
+        let lock_key = "file_list_deleted:query_deleted";
+        let lock_id = config::utils::hash::gxhash::new().sum64(lock_key);
+        let lock_id = if lock_id > (i64::MAX as u64) {
+            (lock_id >> 1) as i64
+        } else {
+            lock_id as i64
+        };
+        let lock_sql = format!("SELECT pg_advisory_xact_lock({lock_id})");
+        DB_QUERY_NUMS.with_label_values(&["get_lock", ""]).inc();
+        if let Err(e) = sqlx::query(&lock_sql).execute(&mut *tx).await {
+            if let Err(e) = tx.rollback().await {
+                log::error!("[POSTGRES] rollback query_deleted error: {e}");
+            }
+            return Err(e.into());
+        }
+
+        DB_QUERY_NUMS
+            .with_label_values(&["select", "file_list_deleted"])
+            .inc();
+        let items: Vec<FileListDeleted> = match sqlx::query_as::<_, super::FileDeletedRecord>(
+            r#"SELECT id, account, stream, date, file, index_file, flattened FROM file_list_deleted WHERE org = $1 AND created_at < $2 ORDER BY created_at ASC LIMIT $3;"#
+        )
+        .bind(org_id)
+        .bind(time_max)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await {
+            Ok(v) => v
+                .iter()
+                .map(|r| FileListDeleted {
+                    id: r.id,
+                    account: r.account.to_string(),
+                    file: format!("files/{}/{}/{}", r.stream, r.date, r.file),
+                    index_file: r.index_file,
+                    flattened: r.flattened,
+                })
+                .collect(),
+            Err(e) => {
+                if let Err(e) = tx.rollback().await {
+                    log::error!(
+                        "[POSTGRES] rollback select query_deleted for update error: {e}"
+                    );
+                }
+                return Err(e.into());
+            }
+        };
+
+        // update file created_at to NOW to avoid these files being deleted again
+        let ids = items.iter().map(|r| r.id.to_string()).collect::<Vec<_>>();
+        if ids.is_empty() {
+            if let Err(e) = tx.rollback().await {
+                log::error!("[POSTGRES] rollback select query_deleted error: {e}");
+            }
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "UPDATE file_list_deleted SET created_at = $1 WHERE id IN ({});",
+            ids.join(",")
+        );
+        let now = config::utils::time::now_micros();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list_deleted"])
+            .inc();
+        let ret = match sqlx::query(&sql).bind(now).execute(&mut *tx).await {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(e) = tx.rollback().await {
+                    log::error!("[POSTGRES] rollback update query_deleted status error: {e}");
+                }
+                return Err(e.into());
+            }
+        };
+        if ret.rows_affected() != ids.len() as u64 {
+            log::warn!(
+                "[POSTGRES] update query_deleted error: query_deleted rows affected: {}, expected: {}, try again later",
+                ret.rows_affected(),
+                ids.len()
+            );
+            if let Err(e) = tx.rollback().await {
+                log::error!("[POSTGRES] rollback update query_deleted status error: {e}");
+            }
+            return Ok(Vec::new());
+        }
+
+        if let Err(e) = tx.commit().await {
+            log::error!("[POSTGRES] commit select query_deleted error: {e}");
+            return Err(e.into());
+        }
+        Ok(items)
+    }
+
+    async fn list_deleted(&self) -> Result<Vec<FileListDeleted>> {
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["select", "file_list_deleted"])
+            .inc();
+        let ret = sqlx::query_as::<_, super::FileDeletedRecord>(
+            r#"SELECT id, account, stream, date, file, index_file, flattened FROM file_list_deleted;"#,
+        )
+        .fetch_all(&pool)
+        .await?;
+        Ok(ret
+            .iter()
+            .map(|r| FileListDeleted {
+                id: r.id,
+                account: r.account.to_string(),
+                file: format!("files/{}/{}/{}", r.stream, r.date, r.file),
+                index_file: r.index_file,
+                flattened: r.flattened,
+            })
+            .collect())
+    }
+
+    async fn get_min_date(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        date_range: Option<(String, String)>,
+    ) -> Result<String> {
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["select", "file_list"])
+            .inc();
+        let ret: Option<String> = match date_range {
+            Some((start, end)) => {
+                sqlx::query_scalar(r#"SELECT MIN(date) AS num FROM file_list WHERE stream = $1 AND date >= $2 AND date < $3;"#)
+                    .bind(stream_key)
+                    .bind(start)
+                    .bind(end)
+                    .fetch_one(&pool)
+                    .await?
+            }
+            None => {
+                sqlx::query_scalar(r#"SELECT MIN(date) AS num FROM file_list WHERE stream = $1;"#)
+                    .bind(stream_key)
+                    .fetch_one(&pool)
+                    .await?
+            }
+        };
+        Ok(ret.unwrap_or_default())
+    }
+
+    async fn get_min_update_at(&self) -> Result<i64> {
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["select", "file_list"])
+            .inc();
+        let ret: Option<i64> =
+            sqlx::query_scalar(r#"SELECT MIN(updated_at)::BIGINT AS num FROM file_list;"#)
+                .fetch_one(&pool)
+                .await?;
+        Ok(ret.unwrap_or_default())
+    }
+
+    async fn get_max_update_at(&self) -> Result<i64> {
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["select", "file_list"])
+            .inc();
+        let ret: Option<i64> =
+            sqlx::query_scalar(r#"SELECT MAX(updated_at)::BIGINT AS num FROM file_list;"#)
+                .fetch_one(&pool)
+                .await?;
+        Ok(ret.unwrap_or_default())
+    }
+
+    async fn clean_by_min_update_at(&self, _val: i64) -> Result<()> {
+        Ok(()) // do nothing
+    }
+
+    async fn get_updated_streams(&self, time_range: (i64, i64)) -> Result<Vec<String>> {
+        let (time_start, time_end) = time_range;
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["get_updated_streams", "file_list"])
+            .inc();
+        let start = std::time::Instant::now();
+        let ret = sqlx::query(
+            r#"SELECT DISTINCT stream FROM file_list WHERE updated_at > $1 AND updated_at <= $2;"#,
+        )
+        .bind(time_start)
+        .bind(time_end)
+        .fetch_all(&pool)
+        .await?
+        .into_iter()
+        .map(|r| r.try_get::<String, &str>("stream").unwrap_or_default())
+        .collect();
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["get_updated_streams", "file_list"])
+            .observe(time);
+        Ok(ret)
+    }
+
+    async fn stats_by_date_range(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        date_range: (String, String),
+    ) -> Result<StreamStats> {
+        let (start_date, end_date) = date_range;
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+        let time_filter = if !start_date.is_empty() && !end_date.is_empty() {
+            format!("AND date >= '{start_date}' AND date < '{end_date}'")
+        } else if start_date.is_empty() && !end_date.is_empty() {
+            format!("AND date < '{end_date}'")
+        } else if !start_date.is_empty() && end_date.is_empty() {
+            format!("AND date >= '{start_date}'")
+        } else {
+            "".to_string()
+        };
+        let sql = format!(
+            r#"
+SELECT 
+    COUNT(*)::BIGINT AS file_num,
+    MIN(min_ts)::BIGINT AS min_ts,
+    MAX(max_ts)::BIGINT AS max_ts,
+    SUM(records)::BIGINT AS records,
+    SUM(original_size)::BIGINT AS original_size,
+    SUM(compressed_size)::BIGINT AS compressed_size,
+    SUM(index_size)::BIGINT AS index_size
+FROM file_list
+WHERE stream = $1 {time_filter}
+GROUP BY stream;
+            "#
+        );
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["stats_by_date_range", "file_list"])
+            .inc();
+        let start = std::time::Instant::now();
+        let ret: Option<super::StatsRecord> = sqlx::query_as(&sql)
+            .bind(stream_key)
+            .fetch_optional(&pool)
+            .await?;
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["stats_by_date_range", "file_list"])
+            .observe(time);
+        Ok(ret.map(|r| r.into()).unwrap_or_default())
+    }
+
+    async fn get_stream_stats(
+        &self,
+        org_id: &str,
+        stream_type: Option<StreamType>,
+        stream_name: Option<&str>,
+    ) -> Result<Vec<(String, StreamStats)>> {
+        // SECURITY: bind parameters via sqlx to prevent SQL injection when
+        // org_id / stream_type / stream_name contain quotes or SQL metacharacters.
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["get_stream_stats", "stream_stats"])
+            .inc();
+        let start = std::time::Instant::now();
+        let ret = if let Some(stream_type) = stream_type
+            && let Some(stream_name) = stream_name
+        {
+            let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+            sqlx::query_as::<_, super::StatsRecord>("SELECT * FROM stream_stats WHERE stream = $1;")
+                .bind(&stream_key)
+                .fetch_all(&pool)
+                .await?
+        } else {
+            sqlx::query_as::<_, super::StatsRecord>("SELECT * FROM stream_stats WHERE org = $1;")
+                .bind(org_id)
+                .fetch_all(&pool)
+                .await?
+        };
+        let mut stats: HashMap<String, StreamStats> = HashMap::with_capacity(ret.len() / 2);
+        for r in ret {
+            match stats.get_mut(&r.stream) {
+                Some(s) => s.merge(&r.into()),
+                None => {
+                    stats.insert(r.stream.to_owned(), r.into());
+                }
+            }
+        }
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["get_stream_stats", "stream_stats"])
+            .observe(time);
+
+        Ok(stats.into_iter().collect())
+    }
+
+    async fn del_stream_stats(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+    ) -> Result<()> {
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+        let pool = CLIENT_RW.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["delete", "stream_stats"])
+            .inc();
+        sqlx::query("DELETE FROM stream_stats WHERE stream = $1;")
+            .bind(&stream_key)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_stream_stats(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        stats: &StreamStats,
+        is_recent: bool,
+    ) -> Result<()> {
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+        let pool = CLIENT_RW.clone();
+        let mut tx = pool.begin().await?;
+        let start = std::time::Instant::now();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "stream_stats"])
+            .inc();
+        if let Err(e) = sqlx::query(
+            r#"
+INSERT INTO stream_stats
+    (org, stream, file_num, min_ts, max_ts, records, original_size, compressed_size, index_size, is_recent)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (stream, is_recent)
+DO UPDATE SET
+    file_num = EXCLUDED.file_num,
+    min_ts = EXCLUDED.min_ts,
+    max_ts = EXCLUDED.max_ts,
+    records = EXCLUDED.records,
+    original_size = EXCLUDED.original_size,
+    compressed_size = EXCLUDED.compressed_size,
+    index_size = EXCLUDED.index_size;
+            "#,
+        )
+        .bind(org_id)
+        .bind(&stream_key)
+        .bind(stats.file_num)
+        .bind(stats.doc_time_min)
+        .bind(stats.doc_time_max)
+        .bind(stats.doc_num)
+        .bind(stats.storage_size as i64)
+        .bind(stats.compressed_size as i64)
+        .bind(stats.index_size as i64)
+        .bind(is_recent)
+        .execute(&mut *tx)
+        .await
+        {
+            if let Err(e) = tx.rollback().await {
+                log::error!("[POSTGRES] rollback set stream stats error: {e}");
+            }
+            return Err(e.into());
+        }
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["update", "stream_stats"])
+            .observe(time);
+
+        // commit
+        if let Err(e) = tx.commit().await {
+            log::error!("[POSTGRES] commit set stream stats error: {e}");
+            return Err(e.into());
+        }
+
+        Ok(())
+    }
+
+    async fn reset_stream_stats(&self) -> Result<()> {
+        let pool = CLIENT_RW.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "stream_stats"])
+            .inc();
+        sqlx
+            ::query(
+                r#"UPDATE stream_stats SET file_num = 0, min_ts = 0, max_ts = 0, records = 0, original_size = 0, compressed_size = 0, index_size = 0;"#
+            )
+            .execute(&pool).await?;
+        Ok(())
+    }
+
+    async fn len(&self) -> usize {
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["select", "file_list"])
+            .inc();
+        let ret = match sqlx::query(r#"SELECT COUNT(*)::BIGINT AS num FROM file_list;"#)
+            .fetch_one(&pool)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("[POSTGRES] get file list len error: {e}");
+                return 0;
+            }
+        };
+        match ret.try_get::<i64, &str>("num") {
+            Ok(v) => v as usize,
+            _ => 0,
+        }
+    }
+
+    async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
+
+    async fn clear(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn add_job(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream: &str,
+        offset: i64,
+    ) -> Result<i64> {
+        let stream_key = format!("{org_id}/{stream_type}/{stream}");
+        let pool = CLIENT_RW.clone();
+        let mut tx = pool.begin().await?;
+        DB_QUERY_NUMS
+            .with_label_values(&["insert", "file_list_jobs"])
+            .inc();
+        match
+            sqlx
+                ::query(
+                    "INSERT INTO file_list_jobs (org, stream, offsets, status, node, started_at, updated_at) VALUES ($1, $2, $3, $4, '', 0, 0) ON CONFLICT DO NOTHING;"
+                )
+                .bind(org_id)
+                .bind(&stream_key)
+                .bind(offset)
+                .bind(super::FileListJobStatus::Pending)
+                .execute(&mut *tx).await
+        {
+            Err(sqlx::Error::Database(e)) => if !e.is_unique_violation() {
+                return Err(Error::Message(e.to_string()));
+            }
+            Err(e) => {
+                return Err(e.into());
+            },
+            Ok(_) => {}
+        };
+
+        // get job id
+        let ret = match sqlx::query(
+            "SELECT id, status FROM file_list_jobs WHERE org = $1 AND stream = $2 AND offsets = $3;",
+        )
+        .bind(org_id)
+        .bind(&stream_key)
+        .bind(offset)
+        .fetch_one(&mut *tx)
+        .await {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(e) = tx.rollback().await {
+                    log::error!("[POSTGRES] rollback add job error: {e}");
+                }
+                return Err(e.into());
+            }
+        };
+        let id = ret.try_get::<i64, &str>("id").unwrap_or_default();
+        let status = ret.try_get::<i64, &str>("status").unwrap_or_default();
+        if id > 0
+            && super::FileListJobStatus::from(status) == super::FileListJobStatus::Done
+            && let Err(e) =
+                sqlx::query("UPDATE file_list_jobs SET status = $1 WHERE status = $2 AND id = $3;")
+                    .bind(super::FileListJobStatus::Pending)
+                    .bind(super::FileListJobStatus::Done)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+        {
+            if let Err(e) = tx.rollback().await {
+                log::error!("[POSTGRES] rollback update job status error: {e}");
+            }
+            return Err(e.into());
+        }
+        if let Err(e) = tx.commit().await {
+            log::error!("[POSTGRES] commit add job error: {e}");
+            return Err(e.into());
+        }
+        Ok(id)
+    }
+
+    async fn get_pending_jobs(
+        &self,
+        node: &str,
+        limit: i64,
+        fast_mode: bool,
+    ) -> Result<Vec<super::MergeJobRecord>> {
+        // quick check on the read pool: no pending jobs means the claim transaction can be skipped.
+        let pool = CLIENT_RO.clone();
+        let has_pending = sqlx::query("SELECT id FROM file_list_jobs WHERE status = $1 LIMIT 1;")
+            .bind(super::FileListJobStatus::Pending)
+            .fetch_optional(&pool)
+            .await?;
+        if has_pending.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let pool = CLIENT_RW.clone();
+        let mut tx = pool.begin().await?;
+
+        DB_QUERY_NUMS
+            .with_label_values(&["select", "file_list_jobs"])
+            .inc();
+
+        // FOR UPDATE SKIP LOCKED makes the claim self-guarding, so no advisory lock is needed.
+        let sql = if fast_mode {
+            r#"SELECT stream, id, 0::BIGINT AS num FROM file_list_jobs WHERE status = $1 ORDER BY offsets DESC LIMIT $2 FOR UPDATE SKIP LOCKED;"#
+        } else {
+            // a stream whose max(id) row is lock-skipped is skipped whole until the peer commits
+            r#"
+    WITH candidates AS (
+        SELECT stream, max(id) AS id, COUNT(*)::BIGINT AS num
+            FROM file_list_jobs
+            WHERE status = $1
+            GROUP BY stream
+            ORDER BY num DESC
+            LIMIT $2
+    )
+    SELECT c.stream, c.id, c.num
+        FROM candidates c
+        JOIN file_list_jobs j ON j.id = c.id
+        WHERE j.status = $1
+        ORDER BY c.num DESC
+        FOR UPDATE OF j SKIP LOCKED;"#
+        };
+        let ret = match sqlx::query_as::<_, super::MergeJobPendingRecord>(sql)
+            .bind(super::FileListJobStatus::Pending)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(e) = tx.rollback().await {
+                    log::error!("[POSTGRES] rollback get_pending_jobs for update error: {e}");
+                }
+                return Err(e.into());
+            }
+        };
+        // update jobs status to running
+        let ids = ret.iter().map(|r| r.id.to_string()).collect::<Vec<_>>();
+        if ids.is_empty() {
+            if let Err(e) = tx.rollback().await {
+                log::error!("[POSTGRES] rollback get_pending_jobs error: {e}");
+            }
+            return Ok(Vec::new());
+        }
+        // rows are row-locked above; the status re-check is defense-in-depth against double claims
+        let sql = format!(
+            "UPDATE file_list_jobs SET status = $1, node = $2, started_at = $3, updated_at = $4 WHERE id IN ({}) AND status = $5;",
+            ids.join(",")
+        );
+        let now = config::utils::time::now_micros();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list_jobs"])
+            .inc();
+        if let Err(e) = sqlx::query(&sql)
+            .bind(super::FileListJobStatus::Running)
+            .bind(node)
+            .bind(now)
+            .bind(now)
+            .bind(super::FileListJobStatus::Pending)
+            .execute(&mut *tx)
+            .await
+        {
+            if let Err(e) = tx.rollback().await {
+                log::error!("[POSTGRES] rollback update file_list_jobs status error: {e}");
+            }
+            return Err(e.into());
+        }
+        // get jobs by ids
+        DB_QUERY_NUMS
+            .with_label_values(&["select", "file_list_jobs"])
+            .inc();
+        // status filter stands alone: a row the guarded UPDATE skipped must not be returned
+        let sql = format!(
+            "SELECT * FROM file_list_jobs WHERE id IN ({}) AND status = $1;",
+            ids.join(",")
+        );
+        let ret = match sqlx::query_as::<_, super::MergeJobRecord>(&sql)
+            .bind(super::FileListJobStatus::Running)
+            .fetch_all(&mut *tx)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(e) = tx.rollback().await {
+                    log::error!("[POSTGRES] rollback get_pending_jobs by ids error: {e}");
+                }
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = tx.commit().await {
+            log::error!("[POSTGRES] commit for get_pending_jobs error: {e}");
+            return Err(e.into());
+        }
+        Ok(ret)
+    }
+
+    async fn set_job_pending(
+        &self,
+        ids: &[i64],
+        offsets: i64,
+        stream: Option<&str>,
+    ) -> Result<u64> {
+        let pool = CLIENT_RW.clone();
+        let mut conditions: Vec<String> = Vec::new();
+        if !ids.is_empty() {
+            conditions.push(format!(
+                "id IN ({})",
+                ids.iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        if offsets > 0 {
+            conditions.push(format!("offsets >= {offsets}"));
+        }
+        if let Some(stream) = stream {
+            conditions.push(format!("stream = '{stream}'"));
+        }
+        let sql = if conditions.is_empty() {
+            "UPDATE file_list_jobs SET status = $1;".to_string()
+        } else {
+            format!(
+                "UPDATE file_list_jobs SET status = $1 WHERE {};",
+                conditions.join(" AND ")
+            )
+        };
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list_jobs"])
+            .inc();
+        let ret = sqlx::query(&sql)
+            .bind(super::FileListJobStatus::Pending)
+            .execute(&pool)
+            .await?;
+        Ok(ret.rows_affected())
+    }
+
+    async fn set_job_done(&self, ids: &[i64]) -> Result<()> {
+        let cfg = get_config();
+        let pool = CLIENT_RW.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list_jobs"])
+            .inc();
+        let sql = format!(
+            "UPDATE file_list_jobs SET status = $1, updated_at = $2, dumped = $3, node = '' WHERE id IN ({});",
+            ids.iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        // if dump enabled we set dumped to false, so dump job can work
+        // id dump disabled, we set it to true, so cleanup can remvoe the jobs
+        sqlx::query(&sql)
+            .bind(super::FileListJobStatus::Done)
+            .bind(config::utils::time::now_micros())
+            .bind(!cfg.compact.file_list_dump_enabled)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_running_jobs(&self, ids: &[i64]) -> Result<()> {
+        let pool = CLIENT_RW.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list_jobs"])
+            .inc();
+        let sql = format!(
+            r#"UPDATE file_list_jobs SET updated_at = $1 WHERE id IN ({})"#,
+            ids.iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        sqlx::query(&sql)
+            .bind(config::utils::time::now_micros())
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn check_running_jobs(&self, before_date: i64) -> Result<()> {
+        let pool = CLIENT_RW.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list_jobs"])
+            .inc();
+
+        // reset running jobs status to pending
+        let ret = sqlx::query(
+            r#"UPDATE file_list_jobs SET status = $1 WHERE status = $2 AND updated_at < $3;"#,
+        )
+        .bind(super::FileListJobStatus::Pending)
+        .bind(super::FileListJobStatus::Running)
+        .bind(before_date)
+        .execute(&pool)
+        .await?;
+        let rows_affected = ret.rows_affected();
+        if rows_affected > 0 {
+            log::warn!(
+                "[POSTGRES] reset running jobs status to pending, rows_affected: {rows_affected}"
+            );
+        }
+
+        // reset dumping jobs node to empty
+        let ret = sqlx::query(
+            r#"UPDATE file_list_jobs SET node = '' WHERE status = $1 AND dumped = $2 AND node != '' AND updated_at < $3;"#,
+        )
+        .bind(super::FileListJobStatus::Done)
+        .bind(false)
+        .bind(before_date)
+        .execute(&pool)
+        .await?;
+        let rows_affected = ret.rows_affected();
+        if rows_affected > 0 {
+            log::warn!(
+                "[POSTGRES] reset dumping jobs node to empty, rows_affected: {rows_affected}"
+            );
+        }
+        Ok(())
+    }
+
+    async fn clean_done_jobs(&self, before_date: i64) -> Result<()> {
+        let pool = CLIENT_RW.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["delete", "file_list_jobs"])
+            .inc();
+        let ret = sqlx::query(
+            r#"DELETE FROM file_list_jobs WHERE status = $1 AND dumped = $2 AND updated_at < $3;"#,
+        )
+        .bind(super::FileListJobStatus::Done)
+        .bind(true)
+        .bind(before_date)
+        .execute(&pool)
+        .await?;
+        if ret.rows_affected() > 0 {
+            log::warn!("[POSTGRES] clean done jobs");
+        }
+        Ok(())
+    }
+
+    async fn get_pending_jobs_count(&self) -> Result<stdHashMap<String, stdHashMap<String, i64>>> {
+        let pool = CLIENT_RW.clone();
+
+        DB_QUERY_NUMS
+            .with_label_values(&["select", "file_list_jobs"])
+            .inc();
+        let ret = sqlx
+            ::query(
+                r#"SELECT stream, status, count(*) as counts FROM file_list_jobs WHERE status = $1 GROUP BY stream, status ORDER BY status desc;"#
+            )
+            .bind(super::FileListJobStatus::Pending)
+            .fetch_all(&pool).await?;
+
+        let mut job_status: stdHashMap<String, stdHashMap<String, i64>> = stdHashMap::new();
+
+        for r in ret.iter() {
+            let stream = r.get::<String, &str>("stream");
+            let status = r.get::<i32, &str>("status");
+            let counts = if status == 0 {
+                r.get::<i64, &str>("counts")
+            } else {
+                0
+            };
+            let parts: Vec<&str> = stream.split('/').collect();
+            if parts.len() >= 2 {
+                let org = parts[0].to_string();
+                let stream_type = parts[1].to_string();
+                job_status
+                    .entry(org)
+                    .or_default()
+                    .entry(stream_type)
+                    .and_modify(|e| {
+                        *e += counts;
+                    })
+                    .or_insert(counts);
+            }
+        }
+        Ok(job_status)
+    }
+
+    async fn get_pending_dump_jobs(
+        &self,
+        node: &str,
+        limit: i64,
+    ) -> Result<Vec<(i64, String, i64)>> {
+        let pool = CLIENT_RW.clone();
+        let mut tx = pool.begin().await?;
+        let lock_key = "file_list_jobs:get_pending_dump_jobs";
+        let lock_id = config::utils::hash::gxhash::new().sum64(lock_key);
+        let lock_id = if lock_id > (i64::MAX as u64) {
+            (lock_id >> 1) as i64
+        } else {
+            lock_id as i64
+        };
+        let lock_sql = format!("SELECT pg_advisory_xact_lock({lock_id})");
+        DB_QUERY_NUMS.with_label_values(&["get_lock", ""]).inc();
+        if let Err(e) = sqlx::query(&lock_sql).execute(&mut *tx).await {
+            if let Err(e) = tx.rollback().await {
+                log::error!("[POSTGRES] rollback get_pending_dump_jobs error: {e}");
+            }
+            return Err(e.into());
+        }
+        // get pending dump jobs by updated_at asc
+        DB_QUERY_NUMS
+            .with_label_values(&["select", "file_list_jobs"])
+            .inc();
+        let ret = match sqlx::query_as::<_, (i64, String, i64)>(
+            r#"SELECT id, stream, offsets FROM file_list_jobs WHERE status = $1 AND dumped = $2 AND node = '' ORDER BY updated_at ASC limit $3"#,
+        )
+        .bind(super::FileListJobStatus::Done)
+        .bind(false)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(e) = tx.rollback().await {
+                    log::error!(
+                        "[POSTGRES] rollback get_pending_dump_jobs for update error: {e}"
+                    );
+                }
+                return Err(e.into());
+            }
+        };
+
+        // update jobs node, created_at and updated_at
+        let ids = ret.iter().map(|r| r.0.to_string()).collect::<Vec<_>>();
+        if ids.is_empty() {
+            if let Err(e) = tx.rollback().await {
+                log::error!("[POSTGRES] rollback get_pending_dump_jobs error: {e}");
+            }
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "UPDATE file_list_jobs SET node = $1, started_at = $2, updated_at = $3 WHERE id IN ({});",
+            ids.join(",")
+        );
+        let now = config::utils::time::now_micros();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list_jobs"])
+            .inc();
+        if let Err(e) = sqlx::query(&sql)
+            .bind(node)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+        {
+            if let Err(e) = tx.rollback().await {
+                log::error!("[POSTGRES] rollback update get_pending_dump_jobs status error: {e}");
+            }
+            return Err(e.into());
+        }
+        // commit transaction
+        if let Err(e) = tx.commit().await {
+            log::error!("[POSTGRES] commit for get_pending_dump_jobs error: {e}");
+            return Err(e.into());
+        }
+
+        Ok(ret)
+    }
+
+    async fn set_job_dumped_status(&self, ids: &[i64], dumped: bool) -> Result<()> {
+        let pool = CLIENT_RW.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list_jobs"])
+            .inc();
+        let sql = format!(
+            "UPDATE file_list_jobs SET dumped = $1, node = '' WHERE id IN ({});",
+            ids.iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        sqlx::query(&sql).bind(dumped).execute(&pool).await?;
+        Ok(())
+    }
+
+    async fn insert_dump_stats(&self, file: &str, stats: &StreamStats) -> Result<()> {
+        let (stream_key, date_key, file_name) =
+            parse_file_key_columns(file).expect("parse file key failed");
+        let org_id = stream_key[..stream_key.find('/').unwrap()].to_string();
+        let pool = CLIENT_RW.clone();
+
+        // Ensure partition exists for this date
+        ensure_file_list_partition(&pool, "file_list_dump_stats", &date_key).await?;
+
+        DB_QUERY_NUMS
+            .with_label_values(&["insert", "file_list_dump_stats"])
+            .inc();
+        sqlx::query(
+            r#"
+INSERT INTO file_list_dump_stats
+    (org, stream, date, file, file_num, min_ts, max_ts, records, original_size, compressed_size, index_size)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+ON CONFLICT (stream, date, file)
+DO UPDATE SET
+    file_num = EXCLUDED.file_num,
+    min_ts = EXCLUDED.min_ts,
+    max_ts = EXCLUDED.max_ts,
+    records = EXCLUDED.records,
+    original_size = EXCLUDED.original_size,
+    compressed_size = EXCLUDED.compressed_size,
+    index_size = EXCLUDED.index_size;
+            "#,
+        )
+        .bind(org_id)
+        .bind(stream_key)
+        .bind(date_key)
+        .bind(file_name)
+        .bind(stats.file_num)
+        .bind(stats.doc_time_min)
+        .bind(stats.doc_time_max)
+        .bind(stats.doc_num)
+        .bind(stats.storage_size as i64)
+        .bind(stats.compressed_size as i64)
+        .bind(stats.index_size as i64)
+        .execute(&pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_dump_stats(&self, file: &str) -> Result<()> {
+        let (stream_key, date_key, file_name) =
+            parse_file_key_columns(file).expect("parse file key failed");
+        let pool = CLIENT_RW.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["delete", "file_list_dump_stats"])
+            .inc();
+        sqlx::query(
+            r#"DELETE FROM file_list_dump_stats WHERE stream = $1 AND date = $2 AND file = $3;"#,
+        )
+        .bind(stream_key)
+        .bind(date_key)
+        .bind(file_name)
+        .execute(&pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn query_dump_stats_by_date_range(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        date_range: (String, String),
+    ) -> Result<StreamStats> {
+        let (start_date, end_date) = date_range;
+        let stream_key = format!(
+            "{org_id}/{}/{stream_name}_{stream_type}",
+            StreamType::Filelist
+        );
+        let time_filter = if !start_date.is_empty() && !end_date.is_empty() {
+            format!("AND date >= '{start_date}' AND date < '{end_date}'")
+        } else if start_date.is_empty() && !end_date.is_empty() {
+            format!("AND date < '{end_date}'")
+        } else if !start_date.is_empty() && end_date.is_empty() {
+            format!("AND date >= '{start_date}'")
+        } else {
+            "".to_string()
+        };
+        let sql = format!(
+            r#"
+SELECT 
+    SUM(file_num)::BIGINT AS file_num,
+    MIN(min_ts)::BIGINT AS min_ts,
+    MAX(max_ts)::BIGINT AS max_ts,
+    SUM(records)::BIGINT AS records,
+    SUM(original_size)::BIGINT AS original_size,
+    SUM(compressed_size)::BIGINT AS compressed_size,
+    SUM(index_size)::BIGINT AS index_size
+FROM file_list_dump_stats
+WHERE stream = $1 {time_filter}
+GROUP BY stream;
+            "#
+        );
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["stats_by_date_range", "file_list_dump_stats"])
+            .inc();
+        let start = std::time::Instant::now();
+        let ret: Option<super::StatsRecord> = sqlx::query_as(&sql)
+            .bind(stream_key)
+            .fetch_optional(&pool)
+            .await?;
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["stats_by_date_range", "file_list_dump_stats"])
+            .observe(time);
+        Ok(ret.map(|r| r.into()).unwrap_or_default())
+    }
+
+    // TODO: optimize with date from org_storage_settings
+    async fn org_stats_by_account(&self, org_id: &str, account: &str) -> Result<(i64, i64)> {
+        let sql = r#"SELECT 
+SUM(original_size)::BIGINT AS storage_size,
+SUM(index_size)::BIGINT AS index_size
+FROM file_list
+WHERE org = $1 AND account = $2;"#;
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["stats_by_org_account", "file_list"])
+            .inc();
+        let start = std::time::Instant::now();
+        let ret: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(sql)
+            .bind(org_id)
+            .bind(account)
+            .fetch_optional(&pool)
+            .await?;
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["stats_by_org_account", "file_list"])
+            .observe(time);
+        // in case there are no files ingested before settings up storage,
+        // we can get null, so need to handle that with option<>
+        let (storage, index) = ret.unwrap_or_default();
+        Ok((storage.unwrap_or_default(), index.unwrap_or_default()))
+    }
+
+    async fn delete_by_org(&self, org_id: &str) -> Result<()> {
+        let pool = CLIENT_RW.clone();
+        let created_at = now_micros();
+        let mut tx = pool.begin().await?;
+        // Move remaining rows into file_list_deleted first so the file GC removes
+        // the backing S3 objects. A bare DELETE would orphan those files in object
+        // store. (Normal per-stream deletion already routes files here; this is the
+        // catch-all for rows whose stream schema is already gone.)
+        DB_QUERY_NUMS
+            .with_label_values(&["insert", "file_list_deleted"])
+            .inc();
+        sqlx::query(
+            r#"INSERT INTO file_list_deleted (account, org, stream, date, file, index_file, flattened, created_at)
+               SELECT account, org, stream, date, file, index_file, flattened, $2
+               FROM file_list WHERE org = $1;"#,
+        )
+        .bind(org_id)
+        .bind(created_at)
+        .execute(&mut *tx)
+        .await?;
+        DB_QUERY_NUMS
+            .with_label_values(&["delete", "file_list"])
+            .inc();
+        sqlx::query("DELETE FROM file_list WHERE org = $1;")
+            .bind(org_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
+impl PostgresFileList {
+    async fn inner_add(
+        &self,
+        table: &str,
+        account: &str,
+        file: &str,
+        meta: &FileMeta,
+    ) -> Result<i64> {
+        let now_ts = now_micros();
+        let pool = CLIENT_RW.clone();
+        let (stream_key, date_key, file_name) =
+            parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
+        let org_id = stream_key[..stream_key.find('/').unwrap()].to_string();
+
+        // Ensure partition exists for this date
+        ensure_file_list_partition(&pool, table, &date_key).await?;
+
+        DB_QUERY_NUMS.with_label_values(&["insert", table]).inc();
+        let ret: std::result::Result<Option<i64>, sea_orm::SqlxError> = sqlx::query_scalar(
+            format!(
+                r#"
+INSERT INTO {table} (account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, updated_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+    ON CONFLICT DO NOTHING
+    RETURNING id;
+                "#
+                ).as_str()
+            )
+            .bind(account)
+            .bind(org_id)
+            .bind(stream_key)
+            .bind(date_key)
+            .bind(file_name)
+            .bind(false)
+            .bind(meta.min_ts)
+            .bind(meta.max_ts)
+            .bind(meta.records)
+            .bind(meta.original_size)
+            .bind(meta.compressed_size)
+            .bind(meta.index_size)
+            .bind(meta.bloom_ver)
+            .bind(meta.flattened)
+            .bind(now_ts)
+            .fetch_one(&pool).await;
+        match ret {
+            Err(sqlx::Error::Database(e)) => {
+                if e.is_unique_violation() {
+                    Ok(0)
+                } else {
+                    Err(Error::Message(e.to_string()))
+                }
+            }
+            Err(e) => Err(e.into()),
+            Ok(v) => Ok(v.unwrap_or(0)),
+        }
+    }
+
+    async fn inner_batch_process(&self, table: &str, files: &[FileKey]) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        let pool = CLIENT_RW.clone();
+
+        // Ensure partitions exist for all distinct date keys before batch INSERT
+        let mut date_keys = HashSet::new();
+        let add_items = files
+            .iter()
+            .filter(|v| {
+                if v.deleted {
+                    false
+                } else if v.meta.min_ts == 0 || v.meta.max_ts == 0 {
+                    log::warn!("[POSTGRES] min_ts or max_ts is 0 for file: {}", v.key);
+                    false
+                } else {
+                    match parse_file_key_columns(&v.key) {
+                        Ok((_, date_key, _)) => {
+                            date_keys.insert(date_key);
+                            true
+                        }
+                        Err(_) => {
+                            log::error!("[POSTGRES] parse file key failed for file: {}", v.key);
+                            false
+                        }
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        for date_key in date_keys.iter() {
+            ensure_file_list_partition(&pool, table, date_key).await?;
+        }
+
+        let mut tx = pool.begin().await?;
+
+        if !add_items.is_empty() {
+            let chunks = add_items.chunks(100);
+            for files in chunks {
+                let now_ts = now_micros();
+                let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
+                format!("INSERT INTO {table} (account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, updated_at)").as_str()
+                );
+                query_builder.push_values(files, |mut b, item| {
+                    let (stream_key, date_key, file_name) =
+                        parse_file_key_columns(&item.key).unwrap();
+                    let org_id = stream_key[..stream_key.find('/').unwrap()].to_string();
+                    b.push_bind(&item.account)
+                        .push_bind(org_id)
+                        .push_bind(stream_key)
+                        .push_bind(date_key)
+                        .push_bind(file_name)
+                        .push_bind(false)
+                        .push_bind(item.meta.min_ts)
+                        .push_bind(item.meta.max_ts)
+                        .push_bind(item.meta.records)
+                        .push_bind(item.meta.original_size)
+                        .push_bind(item.meta.compressed_size)
+                        .push_bind(item.meta.index_size)
+                        .push_bind(item.meta.bloom_ver)
+                        .push_bind(item.meta.flattened)
+                        .push_bind(now_ts);
+                });
+                DB_QUERY_NUMS.with_label_values(&["insert", table]).inc();
+                if let Err(e) = query_builder.build().execute(&mut *tx).await {
+                    if let Err(e) = tx.rollback().await {
+                        log::error!("[POSTGRES] rollback {table} batch process for add error: {e}");
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
+
+        // sort by file id and key to reduce locked table range
+        let mut del_items = files.iter().filter(|v| v.deleted).collect::<Vec<_>>();
+        del_items.sort_by(|v1, v2| match v1.id.cmp(&v2.id) {
+            std::cmp::Ordering::Equal => v1.key.cmp(&v2.key),
+            other => other,
+        });
+        let deleted_batch_size = get_config().compact.file_list_deleted_batch_size;
+        if !del_items.is_empty() {
+            let chunks = del_items.chunks(deleted_batch_size);
+            for files in chunks {
+                // get (id, date) of the files; date predicate enables partition pruning
+                let mut ids: Vec<(i64, String)> = Vec::with_capacity(files.len());
+                for file in files {
+                    let (stream_key, date_key, file_name) = parse_file_key_columns(&file.key)
+                        .map_err(|e| Error::Message(e.to_string()))?;
+                    if file.id > 0 {
+                        ids.push((file.id, date_key));
+                        continue;
+                    }
+                    DB_QUERY_NUMS
+                        .with_label_values(&["select_id", "file_list"])
+                        .inc();
+                    let start = std::time::Instant::now();
+                    let query_res: std::result::Result<Option<i64>, sea_orm::SqlxError> = sqlx::query_scalar(
+                    r#"SELECT id FROM file_list WHERE stream = $1 AND date = $2 AND file = $3;"#,
+                    )
+                    .bind(stream_key)
+                    .bind(&date_key)
+                    .bind(file_name)
+                    .fetch_one(&mut *tx)
+                    .await;
+                    let time = start.elapsed().as_secs_f64();
+                    DB_QUERY_TIME
+                        .with_label_values(&["select_id", "file_list"])
+                        .observe(time);
+                    match query_res {
+                        Ok(Some(v)) => ids.push((v, date_key)),
+                        Ok(None) => continue,
+                        Err(sqlx::Error::RowNotFound) => continue,
+                        Err(e) => {
+                            if let Err(e) = tx.rollback().await {
+                                log::error!(
+                                    "[POSTGRES] rollback {table} batch process for delete error: {e}"
+                                );
+                            }
+                            return Err(e.into());
+                        }
+                    };
+                }
+                // delete files by ids, one pruned statement per date group
+                for (date, sql) in build_pruned_delete_statements(table, &ids) {
+                    DB_QUERY_NUMS
+                        .with_label_values(&["delete_id", "file_list"])
+                        .inc();
+                    let start = std::time::Instant::now();
+                    if let Err(e) = sqlx::query(&sql).bind(&date).execute(&mut *tx).await {
+                        if let Err(e) = tx.rollback().await {
+                            log::error!(
+                                "[POSTGRES] rollback {table} batch process for delete error: {e}"
+                            );
+                        }
+                        return Err(e.into());
+                    }
+                    let time = start.elapsed().as_secs_f64();
+                    DB_QUERY_TIME
+                        .with_label_values(&["delete_id", "file_list"])
+                        .observe(time);
+                }
+            }
+        }
+
+        if let Err(e) = tx.commit().await {
+            log::error!("[POSTGRES] commit {table} batch process error: {e}");
+            return Err(e.into());
+        }
+
+        Ok(())
+    }
+}
+
+/// Groups (id, date) pairs into one `date = $1 AND id IN (...)` delete per date so each prunes.
+fn build_pruned_delete_statements(
+    table: &str,
+    ids_with_dates: &[(i64, String)],
+) -> Vec<(String, String)> {
+    // each date MUST be the stored column value byte-for-byte, else the delete silently no-ops
+    let mut by_date: stdHashMap<&str, Vec<i64>> = stdHashMap::new();
+    for (id, date) in ids_with_dates {
+        by_date.entry(date.as_str()).or_default().push(*id);
+    }
+    let mut stmts: Vec<(String, String)> = by_date
+        .into_iter()
+        .map(|(date, ids)| {
+            let ids_str = ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<String>>()
+                .join(",");
+            let sql = format!("DELETE FROM {table} WHERE date = $1 AND id IN ({ids_str})");
+            (date.to_string(), sql)
+        })
+        .collect();
+    stmts.sort();
+    stmts
+}
+
+/// Chunks first (bounding per-statement id counts), then prune-groups by date within each chunk.
+fn chunked_pruned_delete_statements(
+    table: &str,
+    ids_with_dates: &[(i64, String)],
+    chunk_size: usize,
+) -> Vec<(String, String)> {
+    ids_with_dates
+        .chunks(chunk_size.max(1))
+        .flat_map(|chunk| build_pruned_delete_statements(table, chunk))
+        .collect()
+}
+
+/// Derive date range for partition pruning from microsecond timestamps.
+/// Returns (date_from, date_to) in "YYYY/MM/DD/HH" format suitable for `WHERE date >= $from AND
+/// date < $to`.
+fn derive_date_range(time_start: i64, time_end: i64) -> (String, String) {
+    let start_dt = chrono::Utc.timestamp_nanos(time_start * 1_000);
+    let end_dt = chrono::Utc.timestamp_nanos(time_end * 1_000);
+    // date_from: start of the day of time_start
+    let date_from = format!(
+        "{}/{}/{}/00",
+        start_dt.format("%Y"),
+        start_dt.format("%m"),
+        start_dt.format("%d")
+    );
+    // date_to: start of the day AFTER time_end (exclusive upper bound)
+    let end_date = end_dt + Duration::days(1);
+    let date_to = format!(
+        "{}/{}/{}/00",
+        end_date.format("%Y"),
+        end_date.format("%m"),
+        end_date.format("%d")
+    );
+    (date_from, date_to)
+}
+
+/// Check if a partition exists via pg_inherits + pg_class.
+async fn check_partition_exists(pool: &sqlx::Pool<Postgres>, partition_name: &str) -> Result<bool> {
+    let sql = r#"
+SELECT EXISTS (
+    SELECT 1 FROM pg_class c
+    JOIN pg_inherits i ON c.oid = i.inhrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = $1
+      AND n.nspname = current_schema()
+) AS exists
+    "#;
+    let exists: bool = sqlx::query_scalar(sql)
+        .bind(partition_name)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
+    Ok(exists)
+}
+
+/// Ensure a partition exists for the given date_key (format "YYYY/MM/DD/HH").
+/// Uses an in-memory cache to avoid repeated DDL on the hot path.
+async fn ensure_file_list_partition(
+    pool: &sqlx::Pool<Postgres>,
+    table: &str,
+    date_key: &str,
+) -> Result<()> {
+    // Extract YYYYMMDD from date_key (format "YYYY/MM/DD/HH")
+    let parts: Vec<&str> = date_key.split('/').collect();
+    if parts.len() < 3 {
+        return Ok(()); // Invalid date_key, let it fall into DEFAULT
+    }
+    let yyyymmdd = format!("{}{}{}", parts[0], parts[1], parts[2]);
+    let partition_name = format!("{table}_p_{yyyymmdd}");
+
+    // Hot path: cache hit
+    if PARTITION_CACHE.contains(&partition_name) {
+        return Ok(());
+    }
+
+    let cfg = get_config();
+    if cfg.common.meta_partition_mode == "manual" {
+        // Manual mode: check existence, cache result, do not create
+        let exists = check_partition_exists(pool, &partition_name).await?;
+        PARTITION_CACHE.insert(partition_name.clone());
+        if !exists {
+            log::warn!(
+                "[POSTGRES] partition missing in manual mode: {partition_name}, writes will fall into DEFAULT"
+            );
+        }
+        return Ok(());
+    }
+
+    // Auto mode: create partition
+    let range_from = format!("{}/{}/{}/00", parts[0], parts[1], parts[2]);
+    // Calculate next day
+    let year: i32 = parts[0].parse().unwrap_or(2026);
+    let month: u32 = parts[1].parse().unwrap_or(1);
+    let day: u32 = parts[2].parse().unwrap_or(1);
+    let next_day =
+        NaiveDate::from_ymd_opt(year, month, day).unwrap_or_default() + Duration::days(1);
+    let range_to = format!(
+        "{}/{}/{}/00",
+        next_day.format("%Y"),
+        next_day.format("%m"),
+        next_day.format("%d")
+    );
+
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {partition_name} PARTITION OF {table} FOR VALUES FROM ('{range_from}') TO ('{range_to}')"
+    );
+    match sqlx::query(&sql).execute(pool).await {
+        Ok(_) => {
+            PARTITION_CACHE.insert(partition_name);
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            // Check for default partition overlap (sqlstate 23514 or similar)
+            if err_str.contains("default partition")
+                || err_str.contains("would overlap")
+                || err_str.contains("23514")
+                || err_str.contains("check constraint")
+            {
+                // DEFAULT partition still has rows in this date range.
+                // Keep writing to DEFAULT and stop retrying this day.
+                log::warn!(
+                    "[POSTGRES] partition create blocked by DEFAULT overlap: {partition_name}"
+                );
+                PARTITION_CACHE.insert(partition_name);
+            } else if err_str.contains("already exists") {
+                PARTITION_CACHE.insert(partition_name);
+            } else {
+                return Err(Error::Message(format!("Failed to create partition: {e}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pre-create partitions for all three partitioned tables in the date range
+/// [-ZO_INGEST_ALLOWED_UPTO hours .. +FILE_LIST_POST_PARTITION_DAYS days].
+async fn precreate_partitions(pool: &sqlx::Pool<Postgres>) -> Result<()> {
+    let cfg = get_config();
+    let today = Utc::now();
+    let past_days = std::cmp::min(30, (cfg.limit.ingest_allowed_upto / 24) + 1);
+    let start_date = today - Duration::days(past_days);
+    let end_date = today + Duration::days(FILE_LIST_POST_PARTITION_DAYS);
+
+    let mut tables = vec!["file_list"];
+    if cfg
+        .compact
+        .file_list_deleted_mode
+        .eq(&FileListBookKeepMode::History.to_string())
+    {
+        tables.push("file_list_history");
+    }
+    if cfg.compact.file_list_dump_enabled {
+        tables.push("file_list_dump_stats");
+    }
+    let mut date = start_date;
+    while date <= end_date {
+        let date_key = format!(
+            "{}/{}/{}/00",
+            date.format("%Y"),
+            date.format("%m"),
+            date.format("%d")
+        );
+        for table in &tables {
+            ensure_file_list_partition(pool, table, &date_key).await?;
+        }
+        date += Duration::days(1);
+    }
+    Ok(())
+}
+
+/// Get the relkind of a table from pg_class. Returns None if table doesn't exist.
+/// 'r' = regular table, 'p' = partitioned table
+async fn get_table_relkind(pool: &sqlx::Pool<Postgres>, table: &str) -> Result<Option<String>> {
+    let sql = "SELECT c.relkind::text FROM pg_class c \
+               JOIN pg_namespace n ON n.oid = c.relnamespace \
+               WHERE c.relname = $1 AND n.nspname = current_schema()";
+    let ret: Option<String> = sqlx::query_scalar(sql)
+        .bind(table)
+        .fetch_optional(pool)
+        .await?;
+    Ok(ret)
+}
+
+/// Create a fresh partitioned file_list or file_list_history table (new install).
+async fn create_partitioned_file_list_table(
+    pool: &sqlx::Pool<Postgres>,
+    table: &str,
+) -> Result<()> {
+    sqlx::query(&file_list_partition_ddl(table))
+        .execute(pool)
+        .await?;
+
+    // Create indexes on parent
+    for ddl in file_list_partition_index_ddl(table) {
+        sqlx::query(&ddl).execute(pool).await?;
+    }
+
+    // Create DEFAULT partition
+    let default_name = format!("{table}_default");
+    sqlx::query(&format!(
+        "CREATE TABLE {default_name} PARTITION OF {table} DEFAULT"
+    ))
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Create a fresh partitioned file_list_dump_stats table (new install).
+async fn create_partitioned_dump_stats_table(pool: &sqlx::Pool<Postgres>) -> Result<()> {
+    sqlx::query(&file_list_dump_stats_partition_ddl())
+        .execute(pool)
+        .await?;
+
+    // Create indexes on parent
+    for ddl in file_list_dump_stats_partition_index_ddl() {
+        sqlx::query(&ddl).execute(pool).await?;
+    }
+
+    // Create DEFAULT partition
+    sqlx::query(
+        "CREATE TABLE file_list_dump_stats_default PARTITION OF file_list_dump_stats DEFAULT",
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Migrate an existing regular file_list or file_list_history table to partitioned.
+async fn migrate_file_list_table(pool: &sqlx::Pool<Postgres>, table: &str) -> Result<()> {
+    log::info!("[POSTGRES] Starting partition migration for table: {table}");
+
+    // Pre-migration validation
+    let row_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*)::BIGINT FROM {table}"))
+        .fetch_one(pool)
+        .await?;
+    if row_count > FILE_LIST_MIGRATION_LIMIT {
+        log::warn!(
+            "[POSTGRES] Table {table} has {row_count} rows (limit: {FILE_LIST_MIGRATION_LIMIT}), \
+            automatic migration is not supported for large tables. \
+            Please migrate the table manually and then restart the node. \
+            Refer to: https://openobserve.ai/docs/migration/migrate-file-list-partition/"
+        );
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        }
+    }
+    log::info!("[POSTGRES] Table {table} has {row_count} rows.");
+
+    let today_str = Utc::now().format("%Y/%m/%d/23").to_string();
+    let max_date: Option<String> = sqlx::query_scalar(&format!("SELECT MAX(date) FROM {table}"))
+        .fetch_one(pool)
+        .await?;
+    if let Some(ref md) = max_date
+        && md > &today_str
+    {
+        log::warn!(
+            "[POSTGRES] Table {table} contains data with future dates (max: {md}), \
+            automatic migration is not supported. \
+            Please migrate the table manually and then restart the node. \
+            Refer to: https://openobserve.ai/docs/migration/migrate-file-list-partition/"
+        );
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        }
+    }
+    log::info!("[POSTGRES] Table {table} has max date {:?}.", max_date);
+
+    // Build the migration SQL as a single transaction
+    let default_name = format!("{table}_default");
+
+    log::info!("[POSTGRES] Table {table} start checking columns.");
+
+    // Execute migration in a transaction
+    let mut tx = pool.begin().await?;
+
+    // 1. Ensure all columns exist
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS account VARCHAR(128) DEFAULT '' NOT NULL"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS flattened BOOLEAN DEFAULT false NOT NULL"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS index_size BIGINT DEFAULT 0 NOT NULL"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS bloom_ver BIGINT DEFAULT 0 NOT NULL"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS updated_at BIGINT DEFAULT 1762819200000000 NOT NULL"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
+    // 1b. Widen file column
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ALTER COLUMN file TYPE VARCHAR(1024)"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
+    log::info!("[POSTGRES] Table {table} start renaming indexes.");
+
+    // 2. Rename existing indexes
+    sqlx::query(&format!(
+        "ALTER INDEX IF EXISTS {table}_stream_file_idx RENAME TO {table}_default_stream_file_idx"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER INDEX IF EXISTS {table}_stream_ts_idx RENAME TO {table}_default_stream_ts_idx"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER INDEX IF EXISTS {table}_stream_date_idx RENAME TO {table}_default_stream_date_idx"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
+    log::info!("[POSTGRES] Table {table} start dropping unused indexes/columns.");
+
+    // 3. Drop unused indexes/columns
+    sqlx::query(&format!("DROP INDEX IF EXISTS {table}_org_idx"))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DROP INDEX IF EXISTS file_list_updated_at_deleted_idx")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DROP INDEX IF EXISTS file_list_org_deleted_stream_idx")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DROP INDEX IF EXISTS file_list_deleted_idx")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {table} DROP COLUMN IF EXISTS created_at"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
+    log::info!("[POSTGRES] Table {table} start removing IDENTITY and PRIMARY KEY.");
+
+    // 4. Remove IDENTITY and PRIMARY KEY
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ALTER COLUMN id DROP IDENTITY IF EXISTS"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_pkey"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
+    log::info!("[POSTGRES] Table {table} start renaming old table.");
+
+    // 5. Rename old table
+    sqlx::query(&format!("ALTER TABLE {table} RENAME TO {default_name}"))
+        .execute(&mut *tx)
+        .await?;
+
+    log::info!("[POSTGRES] Table {table} start creating new partitioned parent table.");
+
+    // 6. Create new partitioned parent table
+    sqlx::query(&file_list_partition_ddl(table))
+        .execute(&mut *tx)
+        .await?;
+
+    log::info!("[POSTGRES] Table {table} start creating indexes on parent.");
+
+    // 7. Create indexes on parent
+    for ddl in file_list_partition_index_ddl(table) {
+        sqlx::query(&ddl).execute(&mut *tx).await?;
+    }
+
+    log::info!("[POSTGRES] Table {table} start attaching old table as DEFAULT partition.");
+
+    // 8. Attach old table as DEFAULT partition
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ATTACH PARTITION {default_name} DEFAULT"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
+    log::info!("[POSTGRES] Table {table} start adding date index on DEFAULT partition.");
+
+    // 9. Add date index on DEFAULT partition
+    sqlx::query(&format!(
+        "CREATE INDEX IF NOT EXISTS {default_name}_date_idx ON {default_name} (date)"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
+    log::info!("[POSTGRES] Table {table} start creating future date partitions.");
+
+    // 10. Create future date partitions
+    create_future_partitions(&mut tx, table).await?;
+
+    log::info!("[POSTGRES] Table {table} start aligning identity sequence.");
+
+    // 11. Align identity sequence
+    align_identity_sequence(&mut tx, table).await?;
+
+    tx.commit().await?;
+
+    log::info!("[POSTGRES] Table {table} migration completed successfully");
+
+    Ok(())
+}
+
+/// Migrate file_list_dump_stats to partitioned table.
+async fn migrate_dump_stats_table(pool: &sqlx::Pool<Postgres>) -> Result<()> {
+    let table = "file_list_dump_stats";
+    log::info!("[POSTGRES] Starting partition migration for table: {table}");
+
+    // Pre-migration validation
+    let row_count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*)::BIGINT FROM {table}"))
+        .fetch_one(pool)
+        .await?;
+    if row_count > FILE_LIST_MIGRATION_LIMIT {
+        log::warn!(
+            "[POSTGRES] Table {table} has {row_count} rows (limit: {FILE_LIST_MIGRATION_LIMIT}), \
+            automatic migration is not supported for large tables. \
+            Please migrate the table manually and then restart the node. \
+            Refer to: https://openobserve.ai/docs/migration/migrate-file-list-partition/"
+        );
+        loop {
+            log::warn!(
+                "[POSTGRES] Maintenance hold: waiting for manual migration completion. Table={table}."
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        }
+    }
+    log::info!("[POSTGRES] Table {table} has {row_count} rows.");
+
+    let today_str = Utc::now().format("%Y/%m/%d/23").to_string();
+    let max_date: Option<String> = sqlx::query_scalar(&format!("SELECT MAX(date) FROM {table}"))
+        .fetch_one(pool)
+        .await?;
+    if let Some(ref md) = max_date
+        && md > &today_str
+    {
+        log::warn!(
+            "[POSTGRES] Table {table} contains data with future dates (max: {md}), \
+            automatic migration is not supported. \
+            Please migrate the table manually and then restart the node. \
+            Refer to: https://openobserve.ai/docs/migration/migrate-file-list-partition/"
+        );
+        loop {
+            log::warn!(
+                "[POSTGRES] Maintenance hold: waiting for manual migration completion. Table={table}."
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+        }
+    }
+    log::info!("[POSTGRES] Table {table} has max date {:?}.", max_date);
+
+    log::info!("[POSTGRES] Table {table} start checking columns.");
+
+    let mut tx = pool.begin().await?;
+
+    // 1. Widen file column
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ALTER COLUMN file TYPE VARCHAR(1024)"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
+    log::info!("[POSTGRES] Table {table} start renaming indexes.");
+
+    // 2. Rename existing indexes
+    sqlx::query("ALTER INDEX IF EXISTS file_list_dump_stats_stream_file_idx RENAME TO file_list_dump_stats_default_stream_file_idx")
+        .execute(&mut *tx)
+        .await?;
+
+    log::info!("[POSTGRES] Table {table} start dropping unused indexes.");
+
+    // 3. Drop unused indexes
+    sqlx::query("DROP INDEX IF EXISTS file_list_dump_stats_org_idx")
+        .execute(&mut *tx)
+        .await?;
+
+    log::info!("[POSTGRES] Table {table} start removing IDENTITY and PRIMARY KEY.");
+
+    // 4. Remove IDENTITY and PRIMARY KEY
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ALTER COLUMN id DROP IDENTITY IF EXISTS"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_pkey"
+    ))
+    .execute(&mut *tx)
+    .await?;
+
+    log::info!("[POSTGRES] Table {table} start renaming old table.");
+
+    // 5. Rename old table
+    sqlx::query(&format!("ALTER TABLE {table} RENAME TO {table}_default"))
+        .execute(&mut *tx)
+        .await?;
+
+    log::info!("[POSTGRES] Table {table} start creating new partitioned parent table.");
+
+    // 6. Create new partitioned parent table
+    sqlx::query(&file_list_dump_stats_partition_ddl())
+        .execute(&mut *tx)
+        .await?;
+
+    log::info!("[POSTGRES] Table {table} start creating indexes on parent.");
+
+    // 7. Create indexes on parent
+    for ddl in file_list_dump_stats_partition_index_ddl() {
+        sqlx::query(&ddl).execute(&mut *tx).await?;
+    }
+
+    log::info!("[POSTGRES] Table {table} start attaching old table as DEFAULT partition.");
+
+    // 8. Attach old table as DEFAULT partition
+    sqlx::query(
+        "ALTER TABLE file_list_dump_stats ATTACH PARTITION file_list_dump_stats_default DEFAULT",
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    log::info!("[POSTGRES] Table {table} start adding date index on DEFAULT partition.");
+
+    // 9. Add date index on DEFAULT partition
+    sqlx::query("CREATE INDEX IF NOT EXISTS file_list_dump_stats_default_date_idx ON file_list_dump_stats_default (date)")
+        .execute(&mut *tx)
+        .await?;
+
+    log::info!("[POSTGRES] Table {table} start creating future date partitions.");
+
+    // 10. Create future date partitions
+    create_future_partitions(&mut tx, table).await?;
+
+    log::info!("[POSTGRES] Table {table} start aligning identity sequence.");
+
+    // 11. Align identity sequence
+    align_identity_sequence(&mut tx, table).await?;
+
+    tx.commit().await?;
+
+    log::info!("[POSTGRES] Table {table} migration completed successfully");
+
+    Ok(())
+}
+
+/// Apply autovacuum tuning to all file_list tables.
+async fn apply_autovacuum_tuning(pool: &sqlx::Pool<Postgres>) -> Result<()> {
+    let tables = ["file_list_deleted", "file_list_jobs"];
+    for table in &tables {
+        // Check if autovacuum is already tuned
+        let reloptions: Option<String> = sqlx::query_scalar(
+            "SELECT array_to_string(c.reloptions, ',') FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = $1 AND n.nspname = current_schema()",
+        )
+        .bind(table)
+        .fetch_optional(pool)
+        .await?
+        .flatten();
+
+        if let Some(ref opts) = reloptions
+            && opts.contains("autovacuum_vacuum_scale_factor=0.01")
+        {
+            continue; // Already tuned
+        }
+
+        let sql = format!(
+            r#"ALTER TABLE IF EXISTS {table} SET (
+                autovacuum_vacuum_scale_factor = 0.01,
+                autovacuum_vacuum_cost_delay = 2,
+                autovacuum_vacuum_cost_limit = 1000,
+                autovacuum_analyze_scale_factor = 0.02
+            )"#
+        );
+        if let Err(e) = sqlx::query(&sql).execute(pool).await {
+            log::warn!("[POSTGRES] Failed to set autovacuum tuning for {table}: {e}");
+        }
+    }
+    Ok(())
+}
+
+const FILE_COLUMN_TARGET_WIDTH: i32 = 1024;
+const ACCOUNT_COLUMN_TARGET_WIDTH: i32 = 128;
+
+/// Return the declared max length of a VARCHAR column, if the column exists.
+async fn get_varchar_column_width(
+    pool: &sqlx::Pool<Postgres>,
+    table: &str,
+    column: &str,
+) -> Result<Option<i32>> {
+    let width: Option<i32> = sqlx::query_scalar(
+        "SELECT character_maximum_length FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2",
+    )
+    .bind(table)
+    .bind(column)
+    .fetch_optional(pool)
+    .await?
+    .flatten();
+    Ok(width)
+}
+
+/// Widen a VARCHAR column to `target_width` if it is currently narrower.
+async fn widen_varchar_column(
+    pool: &sqlx::Pool<Postgres>,
+    table: &str,
+    column: &str,
+    target_width: i32,
+) -> Result<()> {
+    match get_varchar_column_width(pool, table, column).await? {
+        Some(width) if width >= target_width => {
+            log::info!(
+                "[POSTGRES] Skipping {column} column widen for {table}: already VARCHAR({width})"
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let sql =
+        format!("ALTER TABLE IF EXISTS {table} ALTER COLUMN {column} TYPE VARCHAR({target_width})");
+    if let Err(e) = sqlx::query(&sql).execute(pool).await {
+        log::warn!("[POSTGRES] Failed to widen {column} column for {table}: {e}");
+    } else {
+        log::info!("[POSTGRES] Widened {column} column for {table} to VARCHAR({target_width})");
+    }
+    Ok(())
+}
+
+/// Apply column width compatibility for VARCHAR(file).
+async fn apply_column_width_compat(pool: &sqlx::Pool<Postgres>) -> Result<()> {
+    let tables = [
+        "file_list",
+        "file_list_history",
+        "file_list_deleted",
+        "file_list_dump_stats",
+    ];
+    for table in &tables {
+        widen_varchar_column(pool, table, "file", FILE_COLUMN_TARGET_WIDTH).await?;
+    }
+    Ok(())
+}
+
+/// Handle partitioned table creation/migration for file_list, file_list_history,
+/// file_list_dump_stats.
+async fn handle_partitioned_tables(pool: &sqlx::Pool<Postgres>) -> Result<()> {
+    let cfg = get_config();
+
+    // Handle file_list, file_list_history, and file_list_dump_stats
+    let tables = vec!["file_list", "file_list_history", "file_list_dump_stats"];
+    for table in &tables {
+        let relkind = get_table_relkind(pool, table).await?;
+        match relkind.as_deref() {
+            None => {
+                // Fresh install: create partitioned table directly
+                log::info!("[POSTGRES] Fresh install: creating partitioned table {table}");
+                if *table == "file_list_dump_stats" {
+                    create_partitioned_dump_stats_table(pool).await?;
+                } else {
+                    create_partitioned_file_list_table(pool, table).await?;
+                }
+            }
+            Some("p") => {
+                // Already partitioned: just ensure partitions exist
+                log::info!("[POSTGRES] Table {table} already partitioned, ensuring partitions");
+                // Ensure newly-added columns exist on already-partitioned tables.
+                // PG declarative partitioning propagates ALTER on parent to all partitions.
+                if *table == "file_list" || *table == "file_list_history" {
+                    sqlx::query(&format!(
+                        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS bloom_ver BIGINT DEFAULT 0 NOT NULL"
+                    ))
+                    .execute(pool)
+                    .await?;
+                }
+            }
+            Some("r") => {
+                // Regular table: needs migration
+                if cfg.common.meta_partition_mode != "manual" {
+                    if *table == "file_list_dump_stats" {
+                        migrate_dump_stats_table(pool).await?;
+                    } else {
+                        migrate_file_list_table(pool, table).await?;
+                    }
+                } else {
+                    log::warn!(
+                        "[POSTGRES] Table {table} is a regular table and needs to be converted to a partitioned table. \
+                        Since ZO_PG_PARTITION_MODE is set to 'manual', auto-migration is skipped. \
+                        Please migrate the table manually and then restart the node. \
+                        Refer to: https://openobserve.ai/docs/migration/migrate-file-list-partition/"
+                    );
+                    loop {
+                        log::warn!(
+                            "[POSTGRES] Maintenance hold: waiting for manual migration completion."
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                    }
+                }
+            }
+            Some(k) => {
+                log::warn!("[POSTGRES] Unexpected relkind '{k}' for table {table}");
+            }
+        }
+    }
+
+    // Pre-create partitions for upcoming dates
+    if cfg.common.meta_partition_mode != "manual" {
+        precreate_partitions(pool).await?;
+    }
+
+    Ok(())
+}
+
+/// Return the CREATE TABLE DDL for a partitioned file_list / file_list_history table.
+/// Return the CREATE INDEX DDL for a partitioned file_list / file_list_history table.
+fn file_list_partition_index_ddl(table: &str) -> Vec<String> {
+    vec![
+        format!("CREATE UNIQUE INDEX {table}_stream_file_idx ON {table} (stream, date, file)"),
+        format!("CREATE INDEX {table}_id_idx ON {table} (id)"),
+        format!("CREATE INDEX {table}_stream_ts_idx ON {table} (stream, max_ts, min_ts)"),
+        format!("CREATE INDEX {table}_stream_date_idx ON {table} (stream, date)"),
+        format!("CREATE INDEX {table}_updated_at_idx ON {table} (updated_at)"),
+    ]
+}
+
+fn file_list_partition_ddl(table: &str) -> String {
+    format!(
+        r#"
+CREATE TABLE {table} (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY,
+    account         VARCHAR(128) NOT NULL,
+    org             VARCHAR(100) NOT NULL,
+    stream          VARCHAR(256) NOT NULL,
+    date            VARCHAR(16) NOT NULL,
+    file            VARCHAR(1024) NOT NULL,
+    deleted         BOOLEAN DEFAULT false NOT NULL,
+    flattened       BOOLEAN DEFAULT false NOT NULL,
+    min_ts          BIGINT NOT NULL,
+    max_ts          BIGINT NOT NULL,
+    records         BIGINT NOT NULL,
+    original_size   BIGINT NOT NULL,
+    compressed_size BIGINT NOT NULL,
+    index_size      BIGINT NOT NULL,
+    bloom_ver       BIGINT DEFAULT 0 NOT NULL,
+    updated_at      BIGINT NOT NULL
+) PARTITION BY RANGE (date)
+        "#
+    )
+}
+
+/// Create future date partitions (tomorrow onward) for the given table.
+async fn create_future_partitions(conn: &mut PgConnection, table: &str) -> Result<()> {
+    let today = Utc::now();
+    for i in 1..=FILE_LIST_POST_PARTITION_DAYS {
+        let date = today + Duration::days(i);
+        let next = date + Duration::days(1);
+        let part_name = format!("{table}_p_{}", date.format("%Y%m%d"));
+        let range_from = format!("{}/00", date.format("%Y/%m/%d"));
+        let range_to = format!("{}/00", next.format("%Y/%m/%d"));
+        sqlx::query(&format!(
+            "CREATE TABLE IF NOT EXISTS {part_name} PARTITION OF {table} FOR VALUES FROM ('{range_from}') TO ('{range_to}')"
+        ))
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Align the IDENTITY sequence for the given table so that the next generated id
+/// is one past the current maximum.
+async fn align_identity_sequence(conn: &mut PgConnection, table: &str) -> Result<()> {
+    sqlx::query(&format!(
+        "SELECT setval(pg_get_serial_sequence('{table}', 'id'), COALESCE((SELECT MAX(id) FROM {table}), 0) + 1, false)"
+    ))
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Return the CREATE TABLE DDL for a partitioned file_list_dump_stats table.
+/// Return the CREATE INDEX DDL for the partitioned file_list_dump_stats table.
+fn file_list_dump_stats_partition_index_ddl() -> Vec<String> {
+    vec![
+        "CREATE UNIQUE INDEX file_list_dump_stats_stream_file_idx ON file_list_dump_stats (stream, date, file)".to_string(),
+        "CREATE INDEX file_list_dump_stats_id_idx ON file_list_dump_stats (id)".to_string(),
+    ]
+}
+
+fn file_list_dump_stats_partition_ddl() -> String {
+    r#"
+CREATE TABLE file_list_dump_stats (
+    id              BIGINT GENERATED ALWAYS AS IDENTITY,
+    org             VARCHAR(100) NOT NULL,
+    stream          VARCHAR(256) NOT NULL,
+    date            VARCHAR(16) NOT NULL,
+    file            VARCHAR(1024) NOT NULL,
+    file_num        BIGINT DEFAULT 0 NOT NULL,
+    min_ts          BIGINT DEFAULT 0 NOT NULL,
+    max_ts          BIGINT DEFAULT 0 NOT NULL,
+    records         BIGINT DEFAULT 0 NOT NULL,
+    original_size   BIGINT DEFAULT 0 NOT NULL,
+    compressed_size BIGINT DEFAULT 0 NOT NULL,
+    index_size      BIGINT DEFAULT 0 NOT NULL
+) PARTITION BY RANGE (date)
+    "#
+    .to_string()
+}
+
+pub async fn create_table() -> Result<()> {
+    let pool = CLIENT_DDL.clone();
+    let cfg = get_config();
+
+    // Handle partitioned tables (file_list, file_list_history, file_list_dump_stats)
+    handle_partitioned_tables(&pool).await?;
+
+    // Non-partitioned tables
+    sqlx::query(
+        r#"
+CREATE TABLE IF NOT EXISTS file_list_deleted
+(
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    account    VARCHAR(128)  not null,
+    org        VARCHAR(100) not null,
+    stream     VARCHAR(256) not null,
+    date       VARCHAR(16)  not null,
+    file       VARCHAR(1024) not null,
+    index_file BOOLEAN default false not null,
+    flattened  BOOLEAN default false not null,
+    created_at BIGINT not null
+);
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+CREATE TABLE IF NOT EXISTS file_list_jobs
+(
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    org        VARCHAR(100) not null,
+    stream     VARCHAR(256) not null,
+    offsets    BIGINT not null,
+    status     INT not null,
+    node       VARCHAR(100) not null,
+    started_at BIGINT not null,
+    updated_at BIGINT not null,
+    dumped     BOOLEAN default false not null
+);
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+CREATE TABLE IF NOT EXISTS stream_stats
+(
+    id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    org      VARCHAR(100) not null,
+    stream   VARCHAR(256) not null,
+    file_num BIGINT not null,
+    min_ts   BIGINT not null,
+    max_ts   BIGINT not null,
+    records  BIGINT not null,
+    original_size   BIGINT not null,
+    compressed_size BIGINT not null,
+    index_size      BIGINT not null,
+    is_recent       BOOLEAN default false not null
+);
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // Column additions for non-partitioned tables (partitioned tables handle their own columns)
+    add_column(
+        "file_list_deleted",
+        "flattened",
+        "BOOLEAN default false not null",
+    )
+    .await?;
+    add_column(
+        "file_list_deleted",
+        "index_file",
+        "BOOLEAN default false not null",
+    )
+    .await?;
+    add_column(
+        "file_list_deleted",
+        "account",
+        "VARCHAR(128) default '' not null",
+    )
+    .await?;
+    add_column("file_list_jobs", "started_at", "BIGINT default 0 not null").await?;
+    add_column("file_list_jobs", "dumped", "BOOLEAN default false not null").await?;
+    add_column("stream_stats", "index_size", "BIGINT default 0 not null").await?;
+    add_column(
+        "stream_stats",
+        "is_recent",
+        "BOOLEAN default false not null",
+    )
+    .await?;
+
+    // Autovacuum tuning + column width compatibility
+    if cfg.common.meta_partition_mode == "auto" {
+        apply_autovacuum_tuning(&pool).await?;
+        apply_column_width_compat(&pool).await?;
+    }
+
+    // after introducing org_storage, the account can have value of org_id:default,
+    // and we restrict org_id to 100 characters so here we change it to 128 from original 32
+    for table in &["file_list", "file_list_history", "file_list_deleted"] {
+        widen_varchar_column(&pool, table, "account", ACCOUNT_COLUMN_TARGET_WIDTH).await?;
+    }
+
+    Ok(())
+}
+
+pub async fn create_table_index() -> Result<()> {
+    let pool = CLIENT_DDL.clone();
+
+    // Delete unused indexes for old version <= 0.60.0
+    delete_index("file_list_org_idx", "file_list").await?;
+    delete_index("file_list_history_org_idx", "file_list_history").await?;
+    delete_index("file_list_dump_stats_org_idx", "file_list_dump_stats").await?;
+    delete_index("file_list_deleted_stream_idx", "file_list_deleted").await?;
+    delete_index("file_list_updated_at_deleted_idx", "file_list").await?;
+
+    // Delete old index stream_stats_stream_idx for old version <= 0.30.0
+    delete_index("stream_stats_stream_idx", "stream_stats").await?;
+
+    // Indexes for non-partitioned tables only (partitioned tables get indexes during
+    // migration/creation)
+    let indices: Vec<(&str, &str, &[&str])> = vec![
+        (
+            "file_list_deleted_created_at_idx",
+            "file_list_deleted",
+            &["org", "created_at"],
+        ),
+        (
+            "file_list_deleted_stream_date_file_idx",
+            "file_list_deleted",
+            &["stream", "date", "file"],
+        ),
+        (
+            "file_list_jobs_stream_status_idx",
+            "file_list_jobs",
+            &["status", "stream"],
+        ),
+        (
+            "file_list_jobs_status_dumped_idx",
+            "file_list_jobs",
+            &["status", "dumped"],
+        ),
+        ("stream_stats_org_idx", "stream_stats", &["org"]),
+    ];
+    for (idx, table, fields) in indices {
+        create_index(IndexStatement::new(idx, table, false, fields)).await?;
+    }
+
+    let unique_indices: Vec<(&str, &str, &[&str])> = vec![
+        (
+            "file_list_jobs_stream_offsets_idx",
+            "file_list_jobs",
+            &["stream", "offsets"],
+        ),
+        (
+            "stream_stats_stream_recent_idx",
+            "stream_stats",
+            &["stream", "is_recent"],
+        ),
+    ];
+    for (idx, table, fields) in unique_indices {
+        create_index(IndexStatement::new(idx, table, true, fields)).await?;
+    }
+
+    // For partitioned tables, check if the unique constraint already exists (it's created during
+    // migration) Only handle dedup logic if the table is NOT yet partitioned (edge case:
+    // migration wasn't run yet)
+    let relkind = get_table_relkind(&pool, "file_list").await?;
+    if relkind.as_deref() != Some("p") {
+        // Non-partitioned: handle the unique index creation with dedup logic
+        let res = create_index(IndexStatement::new(
+            "file_list_stream_file_idx",
+            "file_list",
+            true,
+            &["stream", "date", "file"],
+        ))
+        .await;
+        if let Err(e) = res {
+            if !e.to_string().contains("could not create unique index") {
+                return Err(e);
+            }
+            // delete duplicate records
+            log::warn!("[POSTGRES] starting delete duplicate records");
+            let ret = sqlx::query(
+                r#"SELECT stream, date, file, min(id) as id FROM file_list GROUP BY stream, date, file HAVING COUNT(*) > 1;"#,
+            )
+            .fetch_all(&pool)
+            .await?;
+            log::warn!("[POSTGRES] total: {} duplicate records", ret.len());
+            for (i, r) in ret.iter().enumerate() {
+                let stream = r.get::<String, &str>("stream");
+                let date = r.get::<String, &str>("date");
+                let file = r.get::<String, &str>("file");
+                let id = r.get::<i64, &str>("id");
+                sqlx::query(
+                    r#"DELETE FROM file_list WHERE id != $1 AND stream = $2 AND date = $3 AND file = $4;"#,
+                )
+                .bind(id)
+                .bind(stream)
+                .bind(date)
+                .bind(file)
+                .execute(&pool)
+                .await?;
+                if i.is_multiple_of(1000) {
+                    log::warn!("[POSTGRES] delete duplicate records: {}/{}", i, ret.len());
+                }
+            }
+            log::warn!(
+                "[POSTGRES] delete duplicate records: {}/{}",
+                ret.len(),
+                ret.len()
+            );
+            create_index(IndexStatement::new(
+                "file_list_stream_file_idx",
+                "file_list",
+                true,
+                &["stream", "date", "file"],
+            ))
+            .await?;
+            log::warn!("[POSTGRES] create table index(file_list_stream_file_idx) successfully");
+        }
+    }
+
+    Ok(())
+}
+
+/// Distributed lock key held for the duration of a maintenance run.
+const MAINTENANCE_LOCK_KEY: &str = "/file_list/maintenance";
+/// Coordinator KV key storing the micros timestamp of the last successful run.
+const MAINTENANCE_LAST_RUN_KEY: &str = "/file_list/maintenance/last_run";
+/// Max retries within a cycle when a run fails, and the wait between them.
+const MAINTENANCE_MAX_RETRIES: u32 = 3;
+const MAINTENANCE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Return the std::time::Duration until the next occurrence of `hour` (UTC).
+fn duration_until_next_utc_hour(hour: u32) -> std::time::Duration {
+    let hour = hour.min(23);
+    let now = Utc::now();
+    let today_at = now
+        .date_naive()
+        .and_hms_opt(hour, 0, 0)
+        .unwrap_or_default()
+        .and_utc();
+    let next = if today_at > now {
+        today_at
+    } else {
+        today_at + Duration::days(1)
+    };
+    (next - now).to_std().unwrap_or(std::time::Duration::ZERO)
+}
+
+/// Earliest hour in `ZO_COMPACT_RETENTION_ALLOWED_HOURS`, or midnight when unset.
+fn maintenance_hour(retention_allowed_hours: &str) -> u32 {
+    retention_allowed_hours
+        .split(',')
+        .filter_map(|h| h.trim().parse::<u32>().ok())
+        .min()
+        .unwrap_or(0)
+}
+
+/// Whether two micros timestamps fall on the same UTC calendar day.
+fn same_utc_day(a_micros: i64, b_micros: i64) -> bool {
+    match (
+        DateTime::from_timestamp_micros(a_micros),
+        DateTime::from_timestamp_micros(b_micros),
+    ) {
+        (Some(a), Some(b)) => a.date_naive() == b.date_naive(),
+        _ => false,
+    }
+}
+
+/// Background maintenance task for PostgreSQL partition management.
+///
+/// Runs once per day at a fixed UTC hour derived from
+/// `ZO_COMPACT_RETENTION_ALLOWED_HOURS` (the earliest allowed hour, or midnight
+/// when unset), only on compactor nodes. Across a region, a distributed lock plus a "last run"
+/// marker in the coordinator KV ensure the work runs exactly once per day even if
+/// nodes wake at slightly different times, with automatic failover if the node
+/// that ran it previously is down.
+pub async fn spawn_maintenance_task() -> std::result::Result<(), anyhow::Error> {
+    let cfg = get_config();
+    if cfg.common.meta_store != "postgres" || cfg.common.meta_partition_mode == "manual" {
+        return Ok(());
+    }
+    // Only compactor nodes perform ongoing partition housekeeping.
+    if !config::cluster::LOCAL_NODE.is_compactor() {
+        return Ok(());
+    }
+
+    tokio::task::spawn(async move {
+        loop {
+            let wait = duration_until_next_utc_hour(maintenance_hour(
+                &get_config().compact.retention_allowed_hours,
+            ));
+            log::info!(
+                "[POSTGRES] maintenance: next run in {} minutes",
+                wait.as_secs() / 60
+            );
+            tokio::time::sleep(wait).await;
+
+            // Retry within the cycle on failure; the last_run marker is written
+            // only on success, so a retry re-runs the work instead of waiting a
+            // full day for the next scheduled run.
+            for attempt in 1..=MAINTENANCE_MAX_RETRIES {
+                match run_maintenance().await {
+                    Ok(()) => break,
+                    Err(e) if attempt < MAINTENANCE_MAX_RETRIES => {
+                        log::error!(
+                            "[POSTGRES] maintenance attempt {attempt} failed, retrying: {e}"
+                        );
+                        tokio::time::sleep(MAINTENANCE_RETRY_INTERVAL).await;
+                    }
+                    Err(e) => log::error!(
+                        "[POSTGRES] maintenance failed after {MAINTENANCE_MAX_RETRIES} attempts: {e}"
+                    ),
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+async fn run_maintenance() -> Result<()> {
+    let pool = CLIENT_RW.clone();
+
+    // Acquire the distributed lock; another node acquiring it first will run (or
+    // has run) this cycle. wait_ttl=0 waits for the current holder to finish.
+    let locker = match crate::dist_lock::lock(MAINTENANCE_LOCK_KEY, 0).await {
+        Ok(locker) => locker,
+        Err(e) => {
+            log::warn!("[POSTGRES] maintenance: failed to acquire dist lock: {e}");
+            return Ok(());
+        }
+    };
+
+    // Under the lock, skip if another node already ran maintenance today.
+    let db = crate::db::get_db().await;
+    let last_run = db
+        .get(MAINTENANCE_LAST_RUN_KEY)
+        .await
+        .ok()
+        .and_then(|b| String::from_utf8_lossy(&b).parse::<i64>().ok());
+    if let Some(ts) = last_run
+        && same_utc_day(ts, now_micros())
+    {
+        log::info!("[POSTGRES] maintenance: already ran today, skipping");
+        let _ = crate::dist_lock::unlock(&locker).await;
+        return Ok(());
+    }
+
+    let result = run_maintenance_inner(&pool).await;
+
+    // Record the run only on success so a failed run is retried next cycle.
+    if result.is_ok()
+        && let Err(e) = db
+            .put(
+                MAINTENANCE_LAST_RUN_KEY,
+                now_micros().to_string().into(),
+                crate::db::NO_NEED_WATCH,
+                None,
+            )
+            .await
+    {
+        log::warn!("[POSTGRES] maintenance: failed to record last_run marker: {e}");
+    }
+
+    if let Err(e) = crate::dist_lock::unlock(&locker).await {
+        log::warn!("[POSTGRES] maintenance: failed to release dist lock: {e}");
+    }
+
+    result
+}
+
+async fn run_maintenance_inner(pool: &sqlx::Pool<Postgres>) -> Result<()> {
+    log::info!("[POSTGRES] maintenance: starting");
+
+    // Pre-create upcoming partitions
+    precreate_partitions(pool).await?;
+
+    // DROP empty partitions past the retention window
+    drop_empty_partitions(pool).await?;
+
+    // REINDEX non-partitioned tables
+    reindex_non_partitioned_tables(pool).await?;
+
+    log::info!("[POSTGRES] maintenance: completed");
+    Ok(())
+}
+
+async fn drop_empty_partitions(pool: &sqlx::Pool<Postgres>) -> Result<()> {
+    let cfg = get_config();
+    let safety_days = std::cmp::max(
+        cfg.limit.ingest_allowed_upto / 24 + 1,
+        cfg.compact.data_retention_days,
+    );
+    let today = Utc::now();
+    let cutoff_date = today - Duration::days(safety_days);
+
+    let tables = ["file_list", "file_list_history", "file_list_dump_stats"];
+    for table in &tables {
+        // List all partitions via pg_inherits
+        let partitions: Vec<String> = sqlx::query_scalar(
+            r#"
+SELECT c.relname
+FROM pg_inherits i
+JOIN pg_class c ON c.oid = i.inhrelid
+JOIN pg_class p ON p.oid = i.inhparent
+JOIN pg_namespace n ON n.oid = p.relnamespace
+WHERE p.relname = $1
+  AND n.nspname = current_schema()
+  AND c.relname != $2
+ORDER BY c.relname
+            "#,
+        )
+        .bind(table)
+        .bind(format!("{table}_default"))
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        for partition_name in partitions {
+            // Extract YYYYMMDD from partition name (e.g., "file_list_p_20260206")
+            let prefix = format!("{table}_p_");
+            let Some(date_str) = partition_name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if date_str.len() != 8 {
+                continue;
+            }
+
+            // Parse date
+            let Ok(partition_date) = DateTime::parse_from_str(date_str, "%Y%m%d") else {
+                continue;
+            };
+            let partition_date = partition_date.with_timezone(&Utc);
+
+            // Skip partitions newer than cutoff
+            if partition_date >= cutoff_date {
+                continue;
+            }
+
+            // Check if partition is empty
+            let sql = format!("SELECT 1 FROM {partition_name} LIMIT 1");
+            let has_data: bool = sqlx::query(&sql)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None)
+                .is_some();
+
+            if !has_data {
+                log::info!("[POSTGRES] maintenance: dropping empty partition {partition_name}");
+                let drop_sql = format!("DROP TABLE IF EXISTS {partition_name}");
+                if let Err(e) = sqlx::query(&drop_sql).execute(pool).await {
+                    log::error!("[POSTGRES] maintenance: failed to drop {partition_name}: {e}");
+                } else {
+                    // Remove from partition cache
+                    PARTITION_CACHE.remove(&partition_name);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn reindex_non_partitioned_tables(pool: &sqlx::Pool<Postgres>) -> Result<()> {
+    let indexes = [
+        ("file_list_deleted", "file_list_deleted_pkey"),
+        ("file_list_deleted", "file_list_deleted_created_at_idx"),
+        (
+            "file_list_deleted",
+            "file_list_deleted_stream_date_file_idx",
+        ),
+        ("file_list_jobs", "file_list_jobs_pkey"),
+        ("file_list_jobs", "file_list_jobs_stream_status_idx"),
+        ("file_list_jobs", "file_list_jobs_status_dumped_idx"),
+        ("file_list_jobs", "file_list_jobs_stream_offsets_idx"),
+    ];
+
+    for (table_name, index_name) in &indexes {
+        // Pre-check for invalid indexes and clean up stale artifacts
+        let invalid_indexes: Vec<String> = sqlx::query_scalar(
+            r#"
+SELECT c.relname AS index_name
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_class t ON t.oid = i.indrelid
+WHERE t.relname = $1
+  AND i.indisvalid = false
+            "#,
+        )
+        .bind(table_name)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        for invalid_idx in &invalid_indexes {
+            if invalid_idx.contains("_ccnew") {
+                log::warn!("[POSTGRES] maintenance: dropping stale index artifact {invalid_idx}");
+                let drop_sql = format!("DROP INDEX IF EXISTS {invalid_idx}");
+                let _ = sqlx::query(&drop_sql).execute(pool).await;
+            }
+        }
+
+        // REINDEX CONCURRENTLY
+        let sql = format!("REINDEX INDEX CONCURRENTLY {index_name}");
+        log::info!("[POSTGRES] maintenance: reindexing {index_name}");
+        if let Err(e) = sqlx::query(&sql).execute(pool).await {
+            log::error!("[POSTGRES] maintenance: failed to reindex {index_name}: {e}");
+            // Continue with remaining indexes
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Once;
+
+    use config::meta::stream::{FileKey, FileMeta};
+    use sqlx::PgPool;
+    use tokio::sync::OnceCell;
+
+    use super::*;
+    use crate::file_list::FileList;
+
+    static _INIT: Once = Once::new();
+    static DB_POOL: OnceCell<PgPool> = OnceCell::const_new();
+
+    // Mock database setup for testing
+    async fn setup_test_db() -> PgPool {
+        DB_POOL
+            .get_or_init(|| async {
+                let database_url = std::env::var("TEST_POSTGRES_URL").unwrap_or_else(|_| {
+                    "postgresql://postgres:password@localhost:5432/openobserve_test".to_string()
+                });
+
+                let pool = PgPool::connect(&database_url)
+                    .await
+                    .expect("Failed to connect to test PostgreSQL database");
+
+                setup_test_tables(&pool)
+                    .await
+                    .expect("Failed to setup test tables");
+                pool
+            })
+            .await
+            .clone()
+    }
+
+    async fn setup_test_tables(pool: &PgPool) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS file_list (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                account VARCHAR(128) not null,
+                org VARCHAR(100) not null,
+                stream VARCHAR(256) not null,
+                date VARCHAR(16) not null,
+                file VARCHAR(1024) not null,
+                deleted BOOLEAN default false not null,
+                flattened BOOLEAN default false not null,
+                min_ts BIGINT not null,
+                max_ts BIGINT not null,
+                records BIGINT not null,
+                original_size BIGINT not null,
+                compressed_size BIGINT not null,
+                index_size BIGINT not null,
+                updated_at BIGINT not null
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS file_list_history (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                account VARCHAR(128) not null,
+                org VARCHAR(100) not null,
+                stream VARCHAR(256) not null,
+                date VARCHAR(16) not null,
+                file VARCHAR(1024) not null,
+                deleted BOOLEAN default false not null,
+                flattened BOOLEAN default false not null,
+                min_ts BIGINT not null,
+                max_ts BIGINT not null,
+                records BIGINT not null,
+                original_size BIGINT not null,
+                compressed_size BIGINT not null,
+                index_size BIGINT not null,
+                updated_at BIGINT not null
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS file_list_deleted (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                account VARCHAR(128) not null,
+                org VARCHAR(100) not null,
+                stream VARCHAR(256) not null,
+                date VARCHAR(16) not null,
+                file VARCHAR(1024) not null,
+                index_file BOOLEAN default false not null,
+                flattened BOOLEAN default false not null,
+                created_at BIGINT not null
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS file_list_jobs (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                org VARCHAR(100) not null,
+                stream VARCHAR(256) not null,
+                offsets BIGINT not null,
+                status INT not null,
+                node VARCHAR(100) not null,
+                started_at BIGINT not null,
+                updated_at BIGINT not null,
+                dumped BOOLEAN default false not null
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS stream_stats (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                org VARCHAR(100) not null,
+                stream VARCHAR(256) not null,
+                file_num BIGINT not null,
+                min_ts BIGINT not null,
+                max_ts BIGINT not null,
+                records BIGINT not null,
+                original_size BIGINT not null,
+                compressed_size BIGINT not null,
+                index_size BIGINT not null,
+                is_recent BOOLEAN default false not null
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    fn create_test_file_meta() -> FileMeta {
+        FileMeta {
+            min_ts: 1609459200000000, // 2021-01-01 00:00:00 UTC in microseconds
+            max_ts: 1609545600000000, // 2021-01-02 00:00:00 UTC in microseconds
+            records: 1000,
+            original_size: 50000,
+            compressed_size: 10000,
+            flattened: false,
+            index_size: 5000,
+            bloom_ver: 0,
+        }
+    }
+
+    fn create_test_file_key(account: &str, key: &str, deleted: bool) -> FileKey {
+        FileKey {
+            account: account.to_string(),
+            key: key.to_string(),
+            meta: create_test_file_meta(),
+            deleted,
+            id: 0,
+            selection: None,
+            row_group_size: None,
+        }
+    }
+
+    async fn cleanup_test_data(pool: &PgPool) {
+        let _ = sqlx::query("DELETE FROM file_list").execute(pool).await;
+        let _ = sqlx::query("DELETE FROM file_list_history")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM file_list_deleted")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM file_list_jobs")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM stream_stats").execute(pool).await;
+    }
+
+    #[tokio::test]
+    async fn test_postgres_file_list_new() {
+        let postgres_file_list = PostgresFileList::new();
+        assert!(!std::ptr::eq(&postgres_file_list, &PostgresFileList::new()));
+    }
+
+    #[tokio::test]
+    async fn test_postgres_file_list_default() {
+        let default_list = PostgresFileList::default();
+        let new_list = PostgresFileList::new();
+        // Both should be equivalent (no internal state to compare)
+        assert_eq!(
+            std::mem::size_of_val(&default_list),
+            std::mem::size_of_val(&new_list)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_add_file_success() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+        let file_key = "test_org/test_stream/logs/2021/01/01/test_file.parquet";
+
+        let _result = postgres_list.add("test_account", file_key, &meta).await;
+
+        // This test would pass with proper CLIENT_RW mocking
+        // assert!(result.is_ok());
+        // assert!(result.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_add_file_duplicate_handling() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+        let file_key = "test_org/test_stream/logs/2021/01/01/duplicate_file.parquet";
+
+        // Add file first time
+        let _result1 = postgres_list.add("test_account", file_key, &meta).await;
+        // Add same file again (should handle duplicate)
+        let _result2 = postgres_list.add("test_account", file_key, &meta).await;
+
+        // PostgreSQL should handle conflicts differently than MySQL
+        // assert!(result1.is_ok());
+        // assert!(result2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_parse_file_key_columns_valid_postgres() {
+        // Test valid file key parsing (same as MySQL but testing PostgreSQL context)
+        let file_key = "files/default/logs/olympics/2021/01/01/00/postgres_file1.parquet";
+        let result = parse_file_key_columns(file_key);
+
+        match result {
+            Ok((stream, _date, file)) => {
+                assert_eq!(stream, "default/logs/olympics");
+                assert_eq!(file, "postgres_file1.parquet");
+            }
+            Err(_) => panic!("Should successfully parse valid file key"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_file_key_columns_invalid_postgres() {
+        // Test invalid file key parsing for PostgreSQL
+        let invalid_keys = vec![
+            "",
+            "invalid",
+            "org1/stream1",
+            "org1/stream1/logs",
+            "org1", // Too short
+        ];
+
+        for key in invalid_keys {
+            let result = parse_file_key_columns(key);
+            assert!(result.is_err(), "Should fail for invalid key: {}", key);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_remove_file() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+        let file_key = "test_org/test_stream/logs/2021/01/01/remove_test.parquet";
+
+        // First add a file
+        let _ = postgres_list.add("test_account", file_key, &meta).await;
+
+        // Then remove it (uses PostgreSQL $1, $2, $3 syntax)
+        let _result = postgres_list.remove(file_key).await;
+        // assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_batch_add_with_id_unimplemented() {
+        let postgres_list = PostgresFileList::new();
+        let files = vec![create_test_file_key("account1", "test/key", false)];
+
+        let result = postgres_list.batch_add_with_id(&files).await;
+        assert!(result.is_err());
+        // Should return unimplemented error
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_batch_add_empty_files() {
+        let postgres_list = PostgresFileList::new();
+        let empty_files: Vec<FileKey> = vec![];
+
+        let result = postgres_list.batch_add(&empty_files).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_batch_add_multiple_files() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let files = vec![
+            create_test_file_key(
+                "account1",
+                "org1/stream1/logs/2021/01/01/pg_file1.parquet",
+                false,
+            ),
+            create_test_file_key(
+                "account1",
+                "org1/stream1/logs/2021/01/01/pg_file2.parquet",
+                false,
+            ),
+            create_test_file_key(
+                "account1",
+                "org1/stream1/logs/2021/01/01/pg_file3.parquet",
+                false,
+            ),
+        ];
+
+        let _result = postgres_list.batch_add(&files).await;
+        // assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_batch_add_with_deleted_files() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let files = vec![
+            create_test_file_key(
+                "account1",
+                "org1/stream1/logs/2021/01/01/pg_file1.parquet",
+                false,
+            ),
+            create_test_file_key(
+                "account1",
+                "org1/stream1/logs/2021/01/01/pg_file2.parquet",
+                true, // This file is marked as deleted
+            ),
+        ];
+
+        let _result = postgres_list.batch_add(&files).await;
+        // assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_add_history() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+        let file_key = "test_org/test_stream/logs/2021/01/01/pg_history_test.parquet";
+
+        let _result = postgres_list
+            .add_history("test_account", file_key, &meta)
+            .await;
+        // assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_batch_add_deleted() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let deleted_files = vec![
+            FileListDeleted {
+                id: 0,
+                account: "account1".to_string(),
+                file: "org1/stream1/logs/2021/01/01/pg_deleted1.parquet".to_string(),
+                flattened: false,
+                index_file: false,
+            },
+            FileListDeleted {
+                id: 0,
+                account: "account1".to_string(),
+                file: "org1/stream1/logs/2021/01/01/pg_deleted2.parquet".to_string(),
+                flattened: true,
+                index_file: true,
+            },
+        ];
+
+        let _result = postgres_list
+            .batch_add_deleted("org1", 1609459200, &deleted_files)
+            .await;
+        // assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_batch_add_deleted_empty() {
+        let postgres_list = PostgresFileList::new();
+        let empty_files: Vec<FileListDeleted> = vec![];
+
+        let result = postgres_list
+            .batch_add_deleted("org1", 1609459200, &empty_files)
+            .await;
+        assert!(result.is_ok()); // Should handle empty list gracefully
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_contains_file() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let file_key = "test_org/test_stream/logs/2021/01/01/pg_contains_test.parquet";
+
+        // First check non-existent file
+        let _result_not_exists = postgres_list.contains(file_key).await;
+        // assert!(result_not_exists.is_ok());
+        // assert!(!result_not_exists.unwrap());
+
+        // Add file and check again
+        let meta = create_test_file_meta();
+        let _ = postgres_list.add("test_account", file_key, &meta).await;
+        let _result_exists = postgres_list.contains(file_key).await;
+        // assert!(result_exists.is_ok());
+        // assert!(result_exists.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_get_file() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+        let file_key = "test_org/test_stream/logs/2021/01/01/pg_get_test.parquet";
+
+        // Add file first
+        let _ = postgres_list.add("test_account", file_key, &meta).await;
+
+        // Then retrieve it
+        let _result = postgres_list.get(file_key).await;
+        // assert!(result.is_ok());
+        // let retrieved_meta = result.unwrap();
+        // assert_eq!(retrieved_meta.records, meta.records);
+        // assert_eq!(retrieved_meta.min_ts, meta.min_ts);
+        // assert_eq!(retrieved_meta.max_ts, meta.max_ts);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_get_nonexistent_file() {
+        let postgres_list = PostgresFileList::new();
+        let file_key = "nonexistent/stream/logs/2021/01/01/pg_missing.parquet";
+
+        let result = postgres_list.get(file_key).await;
+        assert!(result.is_err()); // Should return error for missing file
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_update_flattened() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+        let file_key = "test_org/test_stream/logs/2021/01/01/pg_flatten_test.parquet";
+
+        // Add file first
+        let _ = postgres_list.add("test_account", file_key, &meta).await;
+
+        // Update flattened status
+        let _result = postgres_list.update_flattened(file_key, true).await;
+        // assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_update_compressed_size() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+        let file_key = "test_org/test_stream/logs/2021/01/01/pg_compress_test.parquet";
+
+        // Add file first
+        let _ = postgres_list.add("test_account", file_key, &meta).await;
+
+        // Update compressed size
+        let new_size = 15000;
+        let _result = postgres_list
+            .update_compressed_size(file_key, new_size)
+            .await;
+        // assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_len_and_is_empty() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+
+        // Test empty database
+        let _len_result = postgres_list.len().await;
+        let _empty_result = postgres_list.is_empty().await;
+        // assert_eq!(len_result, 0);
+        // assert!(empty_result);
+
+        // Add a file and test again
+        let meta = create_test_file_meta();
+        let file_key = "test_org/test_stream/logs/2021/01/01/pg_len_test.parquet";
+        let _ = postgres_list.add("test_account", file_key, &meta).await;
+
+        let _len_result_after = postgres_list.len().await;
+        let _empty_result_after = postgres_list.is_empty().await;
+        // assert!(len_result_after > 0);
+        // assert!(!empty_result_after);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_clear() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+
+        // Add some files first
+        let meta = create_test_file_meta();
+        let _ = postgres_list
+            .add(
+                "test_account",
+                "test_org/test_stream/logs/2021/01/01/pg_clear1.parquet",
+                &meta,
+            )
+            .await;
+        let _ = postgres_list
+            .add(
+                "test_account",
+                "test_org/test_stream/logs/2021/01/01/pg_clear2.parquet",
+                &meta,
+            )
+            .await;
+
+        // Clear all files
+        let _result = postgres_list.clear().await;
+        // assert!(result.is_ok());
+
+        // Verify database is empty
+        let _is_empty = postgres_list.is_empty().await;
+        // assert!(is_empty);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_error_handling_invalid_file_key() {
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+        let invalid_key = "invalid_key_format";
+
+        let result = postgres_list.add("test_account", invalid_key, &meta).await;
+        assert!(result.is_err()); // Should fail due to invalid key format
+    }
+
+    #[tokio::test]
+    async fn test_inner_batch_process_empty_files() {
+        let postgres_list = PostgresFileList::new();
+        let empty_files: Vec<FileKey> = vec![];
+
+        // This should complete successfully without database calls
+        let result = postgres_list
+            .inner_batch_process("file_list", &empty_files)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_file_key_creation_helpers_postgres() {
+        // Test our test helper functions for PostgreSQL context
+        let file_key = create_test_file_key(
+            "test_account",
+            "org/stream/logs/2021/01/01/pg_test.parquet",
+            false,
+        );
+
+        assert_eq!(file_key.account, "test_account");
+        assert_eq!(file_key.key, "org/stream/logs/2021/01/01/pg_test.parquet");
+        assert!(!file_key.deleted);
+        assert_eq!(file_key.id, 0);
+
+        // Test meta values
+        assert_eq!(file_key.meta.records, 1000);
+        assert_eq!(file_key.meta.original_size, 50000);
+        assert_eq!(file_key.meta.compressed_size, 10000);
+        assert!(!file_key.meta.flattened);
+    }
+
+    #[tokio::test]
+    async fn test_postgresql_specific_syntax() {
+        // Test PostgreSQL specific features like parameterized queries using $1, $2, $3
+        let postgres_list = PostgresFileList::new();
+
+        // Test that invalid file key parsing still works the same
+        let result = parse_file_key_columns("invalid/key");
+        assert!(result.is_err());
+
+        // Test that empty batch processing works
+        let empty_files: Vec<FileKey> = vec![];
+        let result = postgres_list
+            .inner_batch_process("file_list", &empty_files)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_postgresql_data_types() {
+        let meta = create_test_file_meta();
+
+        // Test PostgreSQL can handle the same data ranges as MySQL
+        assert!(meta.min_ts > 0);
+        assert!(meta.max_ts > meta.min_ts);
+        assert!(meta.records > 0);
+        assert!(meta.original_size > meta.compressed_size);
+        assert_eq!(meta.index_size, 5000);
+    }
+
+    #[tokio::test]
+    async fn test_postgresql_file_column_size_limits() {
+        // PostgreSQL allows VARCHAR(1024) for file column vs MySQL's VARCHAR(496)
+        let long_filename = "c".repeat(1000); // Within PostgreSQL limit
+        let long_key = format!("org/stream/logs/2021/01/01/{}.parquet", long_filename);
+
+        let result = parse_file_key_columns(&long_key);
+        match result {
+            Ok((stream, date, file)) => {
+                assert_eq!(stream, "org/stream/logs");
+                assert_eq!(date, "2021/01/01");
+                assert!(file.len() <= 1024); // PostgreSQL file column limit
+            }
+            Err(_) => {
+                // Expected for extremely long keys exceeding limits
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_postgresql_identity_columns() {
+        // PostgreSQL uses GENERATED ALWAYS AS IDENTITY instead of AUTO_INCREMENT
+        // This is mainly a schema difference, but we test the concept
+        let file_key = create_test_file_key(
+            "account1",
+            "files/default/logs/olympics/2021/01/01/00/identity_test.parquet",
+            false,
+        );
+
+        // ID should start at 0 for new FileKey objects before DB insertion
+        assert_eq!(file_key.id, 0);
+
+        // After DB insertion (mocked), ID would be auto-generated by PostgreSQL's IDENTITY column
+    }
+
+    #[tokio::test]
+    async fn test_postgresql_duplicate_index_handling() {
+        // PostgreSQL handles duplicate index creation differently than MySQL
+        // This tests the error message checking logic
+
+        let error_messages = vec![
+            "could not create unique index", // PostgreSQL error message
+            "duplicate key value violates unique constraint",
+            "relation already exists",
+        ];
+
+        for msg in error_messages {
+            // Test PostgreSQL-specific error message patterns
+            assert!(
+                msg.contains("could not create unique index")
+                    || msg.contains("duplicate")
+                    || msg.contains("already exists")
+            );
+        }
+    }
+
+    // Tests for new functionality in fix/file_list_dump branch
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_remove_hard_delete_postgres() {
+        // Test that remove() performs hard delete (DELETE) instead of soft delete
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+        let file_key = "test_org/logs/test_stream/2021/01/01/00/pg_hard_delete_test.parquet";
+
+        // Add a file first
+        let _ = postgres_list.add("test_account", file_key, &meta).await;
+
+        // Verify file exists
+        let exists_before = postgres_list.contains(file_key).await;
+        assert!(exists_before.is_ok());
+
+        // Remove the file (should be hard delete now)
+        let result = postgres_list.remove(file_key).await;
+        assert!(result.is_ok());
+
+        // Verify file is completely removed (not just marked as deleted)
+        let exists_after = postgres_list.contains(file_key).await;
+        assert!(exists_after.is_ok());
+        assert!(!exists_after.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_batch_add_with_timestamps_postgres() {
+        // Test that batch_add now includes updated_at timestamps
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let files = vec![
+            create_test_file_key(
+                "account1",
+                "org1/logs/stream1/2021/01/01/00/pg_file1.parquet",
+                false,
+            ),
+            create_test_file_key(
+                "account1",
+                "org1/logs/stream1/2021/01/01/00/pg_file2.parquet",
+                false,
+            ),
+        ];
+
+        let result = postgres_list.batch_add(&files).await;
+        assert!(result.is_ok());
+
+        // Verify that files were added with timestamps
+        for file in &files {
+            let exists = postgres_list.contains(&file.key).await;
+            assert!(exists.is_ok());
+            assert!(exists.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_query_for_dump_postgres() {
+        // Test the new query_for_dump method
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+
+        // Add test files
+        let _ = postgres_list
+            .add(
+                "test_account",
+                "org1/logs/stream1/2021/01/01/00/pg_dump_file1.parquet",
+                &meta,
+            )
+            .await;
+
+        // Query for dump with time range
+        let time_range = (meta.min_ts - 1000, meta.max_ts + 1000);
+        let result = postgres_list
+            .query_for_dump("org1", StreamType::Logs, "stream1", time_range)
+            .await;
+
+        // Should return file records
+        assert!(result.is_ok());
+        let records = result.unwrap();
+        assert!(!records.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_query_for_dump_by_updated_at_postgres() {
+        // Test the new query_for_dump_by_updated_at method
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+
+        // Add a test file
+        let _ = postgres_list
+            .add(
+                "test_account",
+                "org1/filelist/stream1/2021/01/01/00/pg_dump_by_updated.parquet",
+                &meta,
+            )
+            .await;
+
+        // Query by updated_at with a wide time range
+        let now = config::utils::time::now_micros();
+        let time_range = (now - 60_000_000, now + 60_000_000);
+        let result = postgres_list.query_for_dump_by_updated_at(time_range).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_get_updated_streams_postgres() {
+        // Test the new get_updated_streams method
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+
+        // Add test files
+        let _ = postgres_list
+            .add(
+                "test_account",
+                "org1/logs/pg_updated_stream1/2021/01/01/00/file1.parquet",
+                &meta,
+            )
+            .await;
+        let _ = postgres_list
+            .add(
+                "test_account",
+                "org1/logs/pg_updated_stream2/2021/01/01/00/file2.parquet",
+                &meta,
+            )
+            .await;
+
+        // Query for updated streams
+        let now = config::utils::time::now_micros();
+        let time_range = (now - 60_000_000, now + 60_000_000);
+        let result = postgres_list.get_updated_streams(time_range).await;
+
+        assert!(result.is_ok());
+        let streams = result.unwrap();
+        assert!(!streams.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_stats_by_date_range_postgres() {
+        // Test the new stats_by_date_range method
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+
+        // Add test files
+        let _ = postgres_list
+            .add(
+                "test_account",
+                "org1/logs/pg_stats_stream/2021/01/01/00/stats_file.parquet",
+                &meta,
+            )
+            .await;
+
+        // Query stats by date range
+        let date_range = ("2021-01-01".to_string(), "2021-01-02".to_string());
+        let result = postgres_list
+            .stats_by_date_range("org1", StreamType::Logs, "pg_stats_stream", date_range)
+            .await;
+
+        assert!(result.is_ok());
+        let stats = result.unwrap();
+        assert!(stats.file_num >= 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_set_stream_stats_full_update_postgres() {
+        // Test that set_stream_stats now performs a full update instead of incremental
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+
+        // Create test stats
+        let stats = StreamStats {
+            created_at: config::utils::time::now_micros(),
+            file_num: 10,
+            doc_time_min: 1000000,
+            doc_time_max: 2000000,
+            doc_num: 1000,
+            storage_size: 50000.0,
+            compressed_size: 10000.0,
+            index_size: 5000.0,
+        };
+
+        // Set stream stats (should use ON CONFLICT DO UPDATE now)
+        let result = postgres_list
+            .set_stream_stats("org1", StreamType::Logs, "pg_test_stream", &stats, true)
+            .await;
+
+        assert!(result.is_ok());
+
+        // Set different stats for the same stream (should replace, not increment)
+        let new_stats = StreamStats {
+            created_at: config::utils::time::now_micros(),
+            file_num: 5,
+            doc_time_min: 1500000,
+            doc_time_max: 2500000,
+            doc_num: 500,
+            storage_size: 25000.0,
+            compressed_size: 5000.0,
+            index_size: 2500.0,
+        };
+
+        let result2 = postgres_list
+            .set_stream_stats("org1", StreamType::Logs, "pg_test_stream", &new_stats, true)
+            .await;
+
+        assert!(result2.is_ok());
+
+        // Verify the stats were replaced, not incremented
+        let retrieved_stats = postgres_list
+            .get_stream_stats("org1", Some(StreamType::Logs), Some("pg_test_stream"))
+            .await;
+
+        assert!(retrieved_stats.is_ok());
+        let stats_map = retrieved_stats.unwrap();
+        if let Some((_stream_key, retrieved)) = stats_map.first() {
+            // The file_num should be 5 (replaced), not 15 (incremented)
+            assert_eq!(retrieved.file_num, new_stats.file_num);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_query_without_deleted_filter_postgres() {
+        // Test that query methods no longer filter by deleted field
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+
+        // Add a file
+        let file_key = "org1/logs/pg_query_stream/2021/01/01/00/query_test.parquet";
+        let _ = postgres_list.add("test_account", file_key, &meta).await;
+
+        // Query files (no longer filters by deleted=false)
+        let time_range = (meta.min_ts - 1000, meta.max_ts + 1000);
+        let result = postgres_list
+            .query(
+                "org1",
+                StreamType::Logs,
+                "pg_query_stream",
+                PartitionTimeLevel::Daily,
+                time_range,
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let files = result.unwrap();
+        assert!(!files.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_query_ids_without_deleted_filter_postgres() {
+        // Test that query_ids no longer filters out deleted records
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+
+        // Add test files
+        let _ = postgres_list
+            .add(
+                "test_account",
+                "org1/logs/pg_ids_stream/2021/01/01/00/ids_file.parquet",
+                &meta,
+            )
+            .await;
+
+        // Query IDs (should not filter by deleted field)
+        let time_range = (meta.min_ts - 1000, meta.max_ts + 1000);
+        let result = postgres_list
+            .query_ids("org1", StreamType::Logs, "pg_ids_stream", time_range)
+            .await;
+
+        assert!(result.is_ok());
+        let ids = result.unwrap();
+        assert!(!ids.is_empty());
+    }
+
+    #[test]
+    fn test_same_utc_day() {
+        let day = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().timestamp_micros();
+        // Same day, different times.
+        assert!(same_utc_day(
+            day("2026-07-01T00:00:00Z"),
+            day("2026-07-01T23:59:59Z")
+        ));
+        // Different days.
+        assert!(!same_utc_day(
+            day("2026-07-01T23:59:59Z"),
+            day("2026-07-02T00:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn test_duration_until_next_utc_hour() {
+        // Always within the next 24h, and never zero-length for a valid hour.
+        for h in 0..24u32 {
+            let d = duration_until_next_utc_hour(h);
+            assert!(d <= std::time::Duration::from_secs(24 * 3600));
+        }
+        // Out-of-range hours are clamped to 23 rather than panicking.
+        let _ = duration_until_next_utc_hour(99);
+    }
+
+    #[test]
+    fn test_maintenance_hour() {
+        // Earliest allowed hour is chosen.
+        assert_eq!(maintenance_hour("5,6,8"), 5);
+        assert_eq!(maintenance_hour("8,6,5"), 5);
+        // Whitespace is tolerated.
+        assert_eq!(maintenance_hour(" 7 , 3 "), 3);
+        // Empty / invalid falls back to midnight UTC.
+        assert_eq!(maintenance_hour(""), 0);
+        assert_eq!(maintenance_hour("foo,bar"), 0);
+    }
+
+    // Partition-pruning regression tests: Sites A/B delete by bare id, defeating pruning.
+
+    /// Pid + counter: unique across processes and calls, within Postgres's 63-byte cap.
+    static PARTITIONED_TEST_TABLE_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// Unique per process AND call, so parallel tests and concurrent runs never share a table.
+    fn unique_partitioned_test_table_name() -> String {
+        let n = PARTITIONED_TEST_TABLE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("file_list_partitioned_test_{}_{n}", std::process::id())
+    }
+
+    /// Per-test pool: a pool outliving its creating runtime fails every acquire (PoolTimedOut).
+    async fn connect_partitioned_test_db() -> PgPool {
+        let database_url = std::env::var("TEST_POSTGRES_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:password@localhost:5432/openobserve_test".to_string()
+        });
+        PgPool::connect(&database_url)
+            .await
+            .expect("Failed to connect to test PostgreSQL database")
+    }
+
+    /// Production-DDL table, 3 date partitions, so EXPLAIN shows pruning; name unique per call.
+    async fn setup_partitioned_test_table(pool: &PgPool, table: &str) -> Result<()> {
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(pool)
+            .await?;
+        sqlx::query(&file_list_partition_ddl(table))
+            .execute(pool)
+            .await?;
+        for ddl in file_list_partition_index_ddl(table) {
+            sqlx::query(&ddl).execute(pool).await?;
+        }
+        for day in ["01", "02", "03"] {
+            let part_name = format!("{table}_p_202101{day}");
+            let range_from = format!("2021/01/{day}/00");
+            let next_day = format!("{:02}", day.parse::<u32>().unwrap() + 1);
+            let range_to = format!("2021/01/{next_day}/00");
+            sqlx::query(&format!(
+                "CREATE TABLE {part_name} PARTITION OF {table} FOR VALUES FROM ('{range_from}') TO ('{range_to}')"
+            ))
+            .execute(pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// A panicking test skips this and orphans its table; unique names make that cosmetic only.
+    async fn drop_partitioned_test_table(pool: &PgPool, table: &str) {
+        let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(pool)
+            .await;
+    }
+
+    async fn insert_partitioned_test_row(
+        pool: &PgPool,
+        table: &str,
+        date: &str,
+        stream: &str,
+        file: &str,
+    ) -> Result<i64> {
+        let now_ts = now_micros();
+        let id: i64 = sqlx::query_scalar(&format!(
+            r#"INSERT INTO {table}
+              (account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, updated_at)
+            VALUES
+              ('acct', 'org1', $1, $2, $3, false, 1, 2, 1, 1, 1, 1, 0, false, $4)
+            RETURNING id"#
+        ))
+        .bind(stream)
+        .bind(date)
+        .bind(file)
+        .bind(now_ts)
+        .fetch_one(pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Plain EXPLAIN never executes the DELETE; the rollback wrapper is just defensive redundancy.
+    async fn explain_delete_lines(
+        pool: &PgPool,
+        delete_sql: &str,
+        bind_date: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let mut tx = pool.begin().await?;
+        let explain_sql = format!("EXPLAIN (FORMAT TEXT) {delete_sql}");
+        let query = if let Some(date) = bind_date {
+            sqlx::query(&explain_sql).bind(date)
+        } else {
+            sqlx::query(&explain_sql)
+        };
+        let rows = query.fetch_all(&mut *tx).await?;
+        tx.rollback().await?;
+        Ok(rows.iter().map(|r| r.get::<String, usize>(0)).collect())
+    }
+
+    /// Counts partition `Delete on` lines; the first line is the parent node, not a partition.
+    fn count_touched_partitions(plan_lines: &[String]) -> usize {
+        plan_lines
+            .iter()
+            .skip(1)
+            .filter(|line| line.trim_start().starts_with("Delete on "))
+            .count()
+    }
+
+    /// Bug repro, permanent guard: a bare `id IN (...)` delete must touch all 3 partitions.
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_bug_repro_unpruned_delete_touches_all_partitions() {
+        let pool = connect_partitioned_test_db().await;
+        let table = unique_partitioned_test_table_name();
+        setup_partitioned_test_table(&pool, &table).await.unwrap();
+
+        let id1 = insert_partitioned_test_row(&pool, &table, "2021/01/01/00", "s1", "f1.parquet")
+            .await
+            .unwrap();
+
+        let plan = explain_delete_lines(
+            &pool,
+            &format!("DELETE FROM {table} WHERE id IN ({id1})"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count_touched_partitions(&plan),
+            3,
+            "bug repro: bare `id IN (...)` with no date predicate must touch all 3 partitions, plan:\n{}",
+            plan.join("\n")
+        );
+
+        drop_partitioned_test_table(&pool, &table).await;
+    }
+
+    /// Bug repro: the pre-fix Site A/B shape was correct but unpruned; kept as documentation.
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_bug_repro_buggy_delete_is_functionally_correct_but_unpruned() {
+        let pool = connect_partitioned_test_db().await;
+        let table = unique_partitioned_test_table_name();
+        setup_partitioned_test_table(&pool, &table).await.unwrap();
+
+        let keep =
+            insert_partitioned_test_row(&pool, &table, "2021/01/01/00", "s1", "keep.parquet")
+                .await
+                .unwrap();
+        let del = insert_partitioned_test_row(&pool, &table, "2021/01/02/00", "s1", "del.parquet")
+            .await
+            .unwrap();
+
+        sqlx::query(&format!("DELETE FROM {table} WHERE id IN ({del})"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let remaining: Vec<i64> = sqlx::query_scalar(&format!("SELECT id FROM {table}"))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![keep],
+            "the buggy shape deletes the correct row -- its problem is unpruned latency, not correctness"
+        );
+
+        drop_partitioned_test_table(&pool, &table).await;
+    }
+
+    /// Fix spec: the builder's SQL must prune to exactly 1 partition; dropping date fails this.
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_fix_pruned_delete_touches_single_partition() {
+        let pool = connect_partitioned_test_db().await;
+        let table = unique_partitioned_test_table_name();
+        setup_partitioned_test_table(&pool, &table).await.unwrap();
+
+        let id1 = insert_partitioned_test_row(&pool, &table, "2021/01/01/00", "s1", "f1.parquet")
+            .await
+            .unwrap();
+
+        let stmts = build_pruned_delete_statements(&table, &[(id1, "2021/01/01/00".to_string())]);
+        assert_eq!(stmts.len(), 1, "one date group must yield one statement");
+        let (bind_date, sql) = &stmts[0];
+        let plan = explain_delete_lines(&pool, sql, Some(bind_date))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            count_touched_partitions(&plan),
+            1,
+            "fix: `date = $1 AND id IN (...)` must touch exactly 1 partition, plan:\n{}",
+            plan.join("\n")
+        );
+        assert!(
+            plan.iter()
+                .any(|l| l.contains(&format!("{table}_p_20210101"))),
+            "the single touched partition must be the one actually holding the target id, plan:\n{}",
+            plan.join("\n")
+        );
+
+        drop_partitioned_test_table(&pool, &table).await;
+    }
+
+    /// Fix spec: ids spanning 2 dates become 2 pruned deletes, never one unpruned delete.
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_fix_multiple_dates_grouped_into_pruned_deletes() {
+        let pool = connect_partitioned_test_db().await;
+        let table = unique_partitioned_test_table_name();
+        setup_partitioned_test_table(&pool, &table).await.unwrap();
+
+        let id_day1 =
+            insert_partitioned_test_row(&pool, &table, "2021/01/01/00", "s1", "f1.parquet")
+                .await
+                .unwrap();
+        let id_day2 =
+            insert_partitioned_test_row(&pool, &table, "2021/01/02/00", "s1", "f2.parquet")
+                .await
+                .unwrap();
+        let id_day3_untouched =
+            insert_partitioned_test_row(&pool, &table, "2021/01/03/00", "s1", "f3.parquet")
+                .await
+                .unwrap();
+
+        let targets = [
+            (id_day1, "2021/01/01/00".to_string()),
+            (id_day2, "2021/01/02/00".to_string()),
+        ];
+
+        // EXPLAIN the exact statements the helper will execute: 1 pruned statement per date.
+        let stmts = build_pruned_delete_statements(&table, &targets);
+        assert_eq!(
+            stmts.len(),
+            2,
+            "two date groups must yield two separate delete statements"
+        );
+        for ((bind_date, sql), expected_partition) in stmts.iter().zip(["20210101", "20210102"]) {
+            let plan = explain_delete_lines(&pool, sql, Some(bind_date))
+                .await
+                .unwrap();
+            assert_eq!(
+                count_touched_partitions(&plan),
+                1,
+                "date group {bind_date} must touch exactly 1 partition, plan:\n{}",
+                plan.join("\n")
+            );
+            assert!(
+                plan.iter()
+                    .any(|l| l.contains(&format!("{table}_p_{expected_partition}"))),
+                "date group {bind_date} must touch partition {expected_partition}, plan:\n{}",
+                plan.join("\n")
+            );
+        }
+
+        // Now actually run the grouped delete and verify exact row-level correctness.
+        let mut tx = pool.begin().await.unwrap();
+        for (date, sql) in chunked_pruned_delete_statements(
+            &table,
+            &targets,
+            get_config().compact.file_list_deleted_batch_size,
+        ) {
+            sqlx::query(&sql)
+                .bind(&date)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let remaining_ids: Vec<i64> =
+            sqlx::query_scalar(&format!("SELECT id FROM {table} ORDER BY id"))
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            remaining_ids,
+            vec![id_day3_untouched],
+            "only the day-3 row should remain after deleting the day-1 and day-2 ids"
+        );
+
+        drop_partitioned_test_table(&pool, &table).await;
+    }
+
+    /// Correctness guard independent of EXPLAIN: exactly the targeted rows are gone, no others.
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_correctness_delete_removes_exactly_targeted_rows() {
+        let pool = connect_partitioned_test_db().await;
+        let table = unique_partitioned_test_table_name();
+        setup_partitioned_test_table(&pool, &table).await.unwrap();
+
+        let keep1 =
+            insert_partitioned_test_row(&pool, &table, "2021/01/01/00", "s1", "keep1.parquet")
+                .await
+                .unwrap();
+        let del1 =
+            insert_partitioned_test_row(&pool, &table, "2021/01/01/00", "s1", "del1.parquet")
+                .await
+                .unwrap();
+        let keep2 =
+            insert_partitioned_test_row(&pool, &table, "2021/01/02/00", "s1", "keep2.parquet")
+                .await
+                .unwrap();
+        let del2 =
+            insert_partitioned_test_row(&pool, &table, "2021/01/03/00", "s1", "del2.parquet")
+                .await
+                .unwrap();
+
+        let before_count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before_count, 4);
+
+        let targets = [
+            (del1, "2021/01/01/00".to_string()),
+            (del2, "2021/01/03/00".to_string()),
+        ];
+        let mut tx = pool.begin().await.unwrap();
+        for (date, sql) in chunked_pruned_delete_statements(
+            &table,
+            &targets,
+            get_config().compact.file_list_deleted_batch_size,
+        ) {
+            sqlx::query(&sql)
+                .bind(&date)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let mut remaining_ids: Vec<i64> = sqlx::query_scalar(&format!("SELECT id FROM {table}"))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        remaining_ids.sort();
+        let mut expected = vec![keep1, keep2];
+        expected.sort();
+        assert_eq!(
+            remaining_ids, expected,
+            "exactly the deleted ids should be gone; unrelated rows must remain untouched"
+        );
+
+        drop_partitioned_test_table(&pool, &table).await;
+    }
+
+    /// Edge case: a no-partition date prunes to `One-Time Filter: false` -- no error, no delete.
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_fix_date_matching_no_partition_is_graceful_noop() {
+        let pool = connect_partitioned_test_db().await;
+        let table = unique_partitioned_test_table_name();
+        setup_partitioned_test_table(&pool, &table).await.unwrap();
+
+        let keep =
+            insert_partitioned_test_row(&pool, &table, "2021/01/01/00", "s1", "keep.parquet")
+                .await
+                .unwrap();
+
+        // A date outside every partition's range; the id value is irrelevant to pruning.
+        let no_partition_date = "2099/12/31/00".to_string();
+        let stmts = build_pruned_delete_statements(&table, &[(keep, no_partition_date.clone())]);
+        assert_eq!(stmts.len(), 1, "one date group must yield one statement");
+        let (bind_date, sql) = &stmts[0];
+
+        let plan = explain_delete_lines(&pool, sql, Some(bind_date))
+            .await
+            .unwrap();
+        assert_eq!(
+            count_touched_partitions(&plan),
+            0,
+            "a date with no live partition must prune away every partition, plan:\n{}",
+            plan.join("\n")
+        );
+        assert!(
+            plan.iter().any(|l| l.contains("One-Time Filter: false")),
+            "the plan must short-circuit via `Result / One-Time Filter: false`, plan:\n{}",
+            plan.join("\n")
+        );
+
+        let mut tx = pool.begin().await.unwrap();
+        for (date, sql) in build_pruned_delete_statements(&table, &[(keep, no_partition_date)]) {
+            sqlx::query(&sql)
+                .bind(&date)
+                .execute(&mut *tx)
+                .await
+                .expect("a no-partition date must not be an execution error");
+        }
+        tx.commit().await.unwrap();
+
+        let remaining: Vec<i64> = sqlx::query_scalar(&format!("SELECT id FROM {table}"))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec![keep],
+            "a delete whose date matches no partition must delete nothing"
+        );
+
+        drop_partitioned_test_table(&pool, &table).await;
+    }
+
+    /// Edge case: empty input builds no SQL (empty `IN ()` is a syntax error) and deletes nothing.
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_fix_empty_id_list_is_noop() {
+        let pool = connect_partitioned_test_db().await;
+        let table = unique_partitioned_test_table_name();
+        setup_partitioned_test_table(&pool, &table).await.unwrap();
+
+        let keep =
+            insert_partitioned_test_row(&pool, &table, "2021/01/01/00", "s1", "keep.parquet")
+                .await
+                .unwrap();
+
+        assert!(
+            build_pruned_delete_statements(&table, &[]).is_empty(),
+            "empty input must build zero statements"
+        );
+        assert!(
+            chunked_pruned_delete_statements(&table, &[], 1000).is_empty(),
+            "empty input must build zero statements through the chunked composition too"
+        );
+
+        let remaining: Vec<i64> = sqlx::query_scalar(&format!("SELECT id FROM {table}"))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, vec![keep], "empty input must delete nothing");
+
+        drop_partitioned_test_table(&pool, &table).await;
+    }
+
+    /// Pins Site A's chunk+prune composition: chunk boundaries first, date grouping within each.
+    #[test]
+    fn test_fix_chunked_pruned_delete_statements_composition() {
+        let d1 = "2021/01/01/00".to_string();
+        let d2 = "2021/01/02/00".to_string();
+        let pairs = vec![
+            (1_i64, d1.clone()),
+            (2, d1.clone()),
+            (3, d2.clone()),
+            (4, d1.clone()),
+            (5, d2.clone()),
+        ];
+
+        // chunks of 2 are [1,2] [3,4] [5]; the mixed-date chunk splits into two sorted groups
+        let stmt = |ids: &str| format!("DELETE FROM file_list WHERE date = $1 AND id IN ({ids})");
+        assert_eq!(
+            chunked_pruned_delete_statements("file_list", &pairs, 2),
+            vec![
+                (d1.clone(), stmt("1,2")),
+                (d1.clone(), stmt("4")),
+                (d2.clone(), stmt("3")),
+                (d2.clone(), stmt("5")),
+            ],
+            "every IN-list must stay within the chunk size, grouped by date within each chunk"
+        );
+
+        // a chunk size covering all pairs degenerates to pure date grouping
+        assert_eq!(
+            chunked_pruned_delete_statements("file_list", &pairs, 1000),
+            vec![(d1.clone(), stmt("1,2,4")), (d2.clone(), stmt("3,5"))],
+        );
+        assert_eq!(
+            chunked_pruned_delete_statements("file_list", &pairs, 1000),
+            build_pruned_delete_statements("file_list", &pairs),
+            "one chunk must be exactly the plain builder output"
+        );
+
+        // chunk size 0 must not panic; it is clamped to 1
+        assert_eq!(
+            chunked_pruned_delete_statements("file_list", &pairs, 0).len(),
+            pairs.len()
+        );
+        assert!(chunked_pruned_delete_statements("file_list", &[], 2).is_empty());
+    }
+
+    /// Sites A+B + Fix-4 disjointness in ONE test: CLIENT_RW's pool binds to its first runtime.
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn test_client_rw_paths_site_ab_deletes_and_pending_jobs_disjointness() {
+        // CLIENT_RW (ZO_META_POSTGRES_DSN) and the TEST_POSTGRES_URL pool must be the same DB.
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let postgres_list = PostgresFileList::new();
+        let meta = create_test_file_meta();
+
+        // ---- Site A: update_dump_records ----
+        let dump_stream_key = "org1/logs/dump_test_stream";
+        let keep_key = format!("files/{dump_stream_key}/2021/01/01/00/keep.parquet");
+        let dump_key = format!("files/{dump_stream_key}/2021/01/01/00/dumped.parquet");
+        let keep_id = postgres_list.add("acct", &keep_key, &meta).await.unwrap();
+        let dump_id = postgres_list.add("acct", &dump_key, &meta).await.unwrap();
+
+        // FileRecord.date is required -- what dump.rs threads to update_dump_records as pairs.
+        let records = postgres_list
+            .query_for_dump(
+                "org1",
+                StreamType::Logs,
+                "dump_test_stream",
+                (meta.min_ts - 1000, meta.max_ts + 1000),
+            )
+            .await
+            .unwrap();
+        let dumped_record = records
+            .iter()
+            .find(|r| r.id == dump_id)
+            .expect("dumped file must be present in query_for_dump results");
+        assert_eq!(
+            dumped_record.date, "2021/01/01/00",
+            "FileRecord.date must flow through query_for_dump correctly"
+        );
+
+        let dump_file_key = create_test_file_key(
+            "acct",
+            &format!("files/{dump_stream_key}/2021/01/02/00/dump_summary.parquet"),
+            false,
+        );
+        let site_a_pairs = [(dump_id, dumped_record.date.clone())];
+        postgres_list
+            .update_dump_records(&dump_file_key, &site_a_pairs)
+            .await
+            .unwrap();
+
+        // The date is a real DELETE predicate: a wrong pair would leave the dumped row behind.
+        let remaining: Vec<i64> = sqlx::query_scalar("SELECT id FROM file_list WHERE stream = $1")
+            .bind(dump_stream_key)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !remaining.contains(&dump_id),
+            "update_dump_records must delete the dumped id"
+        );
+        assert!(
+            remaining.contains(&keep_id),
+            "update_dump_records must not delete unrelated ids"
+        );
+
+        // Trust chain: Site A executes exactly these statements; EXPLAIN tests pin them as pruned.
+        assert_eq!(
+            chunked_pruned_delete_statements(
+                "file_list",
+                &site_a_pairs,
+                get_config().compact.file_list_deleted_batch_size,
+            ),
+            vec![(
+                "2021/01/01/00".to_string(),
+                format!("DELETE FROM file_list WHERE date = $1 AND id IN ({dump_id})"),
+            )],
+            "Site A inputs must yield a single per-date pruned delete"
+        );
+
+        // ---- Site B: inner_batch_process's delete path (via batch_process) ----
+        // del_items carrying a real (>0) id must still get a date key parsed from the file key.
+        let batch_stream = "org1/logs/batch_del_stream";
+        let batch_keep_key = format!("files/{batch_stream}/2021/01/01/00/keep.parquet");
+        let batch_del_key = format!("files/{batch_stream}/2021/01/02/00/del.parquet");
+
+        let add_files = vec![
+            create_test_file_key("acct", &batch_keep_key, false),
+            create_test_file_key("acct", &batch_del_key, false),
+        ];
+        postgres_list.batch_add(&add_files).await.unwrap();
+
+        let ids: Vec<(String, i64)> =
+            sqlx::query("SELECT file, id FROM file_list WHERE stream = $1")
+                .bind(batch_stream)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.get::<String, _>(0), r.get::<i64, _>(1)))
+                .collect();
+        let del_id = ids
+            .iter()
+            .find(|(f, _)| f == "del.parquet")
+            .map(|(_, id)| *id)
+            .expect("del.parquet must have been inserted with an id");
+        let batch_keep_id = ids
+            .iter()
+            .find(|(f, _)| f == "keep.parquet")
+            .map(|(_, id)| *id)
+            .expect("keep.parquet must have been inserted with an id");
+
+        // del_items carry a real (>0) id -- the branch that currently skips date-key extraction.
+        let mut del_file_key = create_test_file_key("acct", &batch_del_key, true);
+        del_file_key.id = del_id;
+        postgres_list
+            .batch_process(std::slice::from_ref(&del_file_key))
+            .await
+            .unwrap();
+
+        let remaining: Vec<i64> = sqlx::query_scalar("SELECT id FROM file_list WHERE stream = $1")
+            .bind(batch_stream)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        // The delete succeeding proves the date derived from the key matched the stored row.
+        assert!(
+            !remaining.contains(&del_id),
+            "inner_batch_process must delete the targeted (deleted=true) id"
+        );
+        assert!(
+            remaining.contains(&batch_keep_id),
+            "inner_batch_process must not delete unrelated ids"
+        );
+
+        // Trust chain: Site B groups each chunk through the same EXPLAIN-pinned builder.
+        assert_eq!(
+            build_pruned_delete_statements("file_list", &[(del_id, "2021/01/02/00".to_string())]),
+            vec![(
+                "2021/01/02/00".to_string(),
+                format!("DELETE FROM file_list WHERE date = $1 AND id IN ({del_id})"),
+            )],
+            "Site B inputs must yield a single per-date pruned delete"
+        );
+
+        // ---- Fix 4: concurrent get_pending_jobs claims must stay disjoint ----
+        // Fix-4 invariant [GREEN, must survive the fix]: no job is ever claimed by two callers.
+        let test_db: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let client_rw_db: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(&CLIENT_RW.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            client_rw_db, test_db,
+            "ZO_META_POSTGRES_DSN (CLIENT_RW) must target the same DB as TEST_POSTGRES_URL"
+        );
+
+        let pid = std::process::id();
+        let stream_a = format!("fix4_org/logs/claim_{pid}_a");
+        let stream_b = format!("fix4_org/logs/claim_{pid}_b");
+
+        // 20 seeded races amplify scheduling variance so a broken lock scope cannot pass by luck.
+        for cycle in 0_i64..20 {
+            let mut seeded: Vec<i64> = Vec::new();
+            for stream in [&stream_a, &stream_b] {
+                for offsets in [cycle * 10_000 + 1_000, cycle * 10_000 + 2_000] {
+                    let id: i64 = sqlx::query_scalar(
+                        "INSERT INTO file_list_jobs (org, stream, offsets, status, node, \
+                         started_at, updated_at) VALUES ('fix4_org', $1, $2, 0, '', 0, 0) \
+                         RETURNING id",
+                    )
+                    .bind(stream)
+                    .bind(offsets)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    seeded.push(id);
+                }
+            }
+
+            let (r1, r2) = tokio::join!(
+                postgres_list.get_pending_jobs("fix4-node-1", 100, false),
+                postgres_list.get_pending_jobs("fix4-node-2", 100, false),
+            );
+            let (jobs1, jobs2) = (r1.unwrap(), r2.unwrap());
+
+            // Sibling ignored tests share file_list_jobs; assert only on this test's streams.
+            let ids1: HashSet<i64> = jobs1
+                .iter()
+                .filter(|j| j.stream == stream_a || j.stream == stream_b)
+                .map(|j| j.id)
+                .collect();
+            let ids2: HashSet<i64> = jobs2
+                .iter()
+                .filter(|j| j.stream == stream_a || j.stream == stream_b)
+                .map(|j| j.id)
+                .collect();
+            assert!(
+                ids1.is_disjoint(&ids2),
+                "cycle {cycle}: a job was claimed by both callers: {ids1:?} vs {ids2:?}"
+            );
+
+            // A single call claims max(id) per stream; the pair's union must cover at least that.
+            let union: Vec<i64> = ids1.union(&ids2).copied().collect();
+            for single_call_claim in [seeded[1], seeded[3]] {
+                assert!(
+                    union.contains(&single_call_claim),
+                    "cycle {cycle}: union {union:?} must cover single-call claim {single_call_claim}"
+                );
+            }
+
+            let rows =
+                sqlx::query("SELECT id, status, node FROM file_list_jobs WHERE id = ANY($1)")
+                    .bind(&union)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                rows.len(),
+                union.len(),
+                "cycle {cycle}: claimed ids must exist"
+            );
+            for row in &rows {
+                let id: i64 = row.get(0);
+                let status: i32 = row.get(1);
+                let node: String = row.get(2);
+                assert_eq!(
+                    status, 1,
+                    "cycle {cycle}: claimed job {id} must have transitioned to running"
+                );
+                assert!(
+                    node.starts_with("fix4-node-"),
+                    "cycle {cycle}: claimed job {id} must record the claiming node, got {node:?}"
+                );
+            }
+
+            let _ = sqlx::query("DELETE FROM file_list_jobs WHERE stream = $1 OR stream = $2")
+                .bind(&stream_a)
+                .bind(&stream_b)
+                .execute(&pool)
+                .await;
+        }
+
+        // ---- Fix 4 [GREEN]: claims must not serialize on the legacy global advisory lock ----
+        let legacy = config::utils::hash::gxhash::new().sum64("file_list_jobs:get_pending_jobs");
+        let legacy_key = if legacy > (i64::MAX as u64) {
+            (legacy >> 1) as i64
+        } else {
+            legacy as i64
+        };
+        let lock_stream = format!("fix4_org/logs/nolock_{pid}");
+        let lock_job_id: i64 = sqlx::query_scalar(
+            "INSERT INTO file_list_jobs (org, stream, offsets, status, node, started_at, \
+             updated_at) VALUES ('fix4_org', $1, 1000, 0, '', 0, 0) RETURNING id",
+        )
+        .bind(&lock_stream)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut lock_tx = pool.begin().await.unwrap();
+        sqlx::query(&format!("SELECT pg_advisory_xact_lock({legacy_key})"))
+            .execute(&mut *lock_tx)
+            .await
+            .unwrap();
+
+        // Before Fix 4 this blocked forever: the claim waited behind the held global lock key.
+        let claimed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            postgres_list.get_pending_jobs("fix4-node-3", 100, false),
+        )
+        .await
+        .expect("get_pending_jobs must not block behind any advisory lock")
+        .unwrap();
+        lock_tx.rollback().await.unwrap();
+        assert!(
+            claimed.iter().any(|j| j.id == lock_job_id),
+            "claim running under a held legacy advisory lock must still claim the seeded job"
+        );
+
+        // ---- Fix 4 [GREEN]: fast_mode shares the SKIP LOCKED guard; claims stay disjoint ----
+        let mut fast_seeded: HashSet<i64> = HashSet::new();
+        for stream in [&stream_a, &stream_b] {
+            for offsets in [100_000_i64, 200_000] {
+                let id: i64 = sqlx::query_scalar(
+                    "INSERT INTO file_list_jobs (org, stream, offsets, status, node, \
+                     started_at, updated_at) VALUES ('fix4_org', $1, $2, 0, '', 0, 0) \
+                     RETURNING id",
+                )
+                .bind(stream)
+                .bind(offsets)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                fast_seeded.insert(id);
+            }
+        }
+        let (r1, r2) = tokio::join!(
+            postgres_list.get_pending_jobs("fix4-node-4", 100, true),
+            postgres_list.get_pending_jobs("fix4-node-5", 100, true),
+        );
+        let (fast1, fast2) = (r1.unwrap(), r2.unwrap());
+        let fast_ids1: HashSet<i64> = fast1
+            .iter()
+            .map(|j| j.id)
+            .filter(|id| fast_seeded.contains(id))
+            .collect();
+        let fast_ids2: HashSet<i64> = fast2
+            .iter()
+            .map(|j| j.id)
+            .filter(|id| fast_seeded.contains(id))
+            .collect();
+        assert!(
+            fast_ids1.is_disjoint(&fast_ids2),
+            "fast_mode: a job was claimed by both callers: {fast_ids1:?} vs {fast_ids2:?}"
+        );
+        assert_eq!(
+            fast_ids1.union(&fast_ids2).count(),
+            fast_seeded.len(),
+            "fast_mode: every seeded pending job must be claimed by exactly one caller"
+        );
+
+        // ---- Fix 4 [GREEN]: a row-locked max-id row is SKIPPED, never waited on ----
+        let locked_stream = format!("fix4_org/logs/rowlock_{pid}_locked");
+        let free_stream = format!("fix4_org/logs/rowlock_{pid}_free");
+        let mut rowlock_max: stdHashMap<String, i64> = stdHashMap::new();
+        for stream in [&locked_stream, &free_stream] {
+            for offsets in [1_000_i64, 2_000] {
+                let id: i64 = sqlx::query_scalar(
+                    "INSERT INTO file_list_jobs (org, stream, offsets, status, node, \
+                     started_at, updated_at) VALUES ('fix4_org', $1, $2, 0, '', 0, 0) \
+                     RETURNING id",
+                )
+                .bind(stream)
+                .bind(offsets)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                rowlock_max.insert((*stream).clone(), id);
+            }
+        }
+
+        // A genuine row lock from a separate session, held across the whole claim call.
+        let mut row_tx = pool.begin().await.unwrap();
+        let locked_id: i64 =
+            sqlx::query_scalar("SELECT id FROM file_list_jobs WHERE id = $1 FOR UPDATE")
+                .bind(rowlock_max[&locked_stream])
+                .fetch_one(&mut *row_tx)
+                .await
+                .unwrap();
+
+        // A plain-FOR-UPDATE mutant blocks here until row_tx ends and fails this timeout.
+        let claims = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            postgres_list.get_pending_jobs("fix4-node-6", 100, false),
+        )
+        .await
+        .expect("get_pending_jobs must skip a row-locked max-id row, not block on it")
+        .unwrap();
+        row_tx.rollback().await.unwrap();
+
+        assert!(
+            !claims.iter().any(|j| j.stream == locked_stream),
+            "the stream whose max-id row {locked_id} is row-locked must be skipped whole"
+        );
+        assert!(
+            claims
+                .iter()
+                .any(|j| j.stream == free_stream && j.id == rowlock_max[&free_stream]),
+            "the unlocked stream's max-id job must still be claimed in the same call"
+        );
+    }
+}

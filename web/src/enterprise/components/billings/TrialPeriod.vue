@@ -1,0 +1,137 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <div
+    v-if="showTrialPeriodMsg"
+    data-test="trial-period-container"
+    class="rounded-default bg-status-warning-bg border-status-warning-text text-status-warning-text flex w-full items-center gap-3 border px-4 py-2"
+  >
+    <!-- Warning icon -->
+    <OIcon name="warning" size="sm" class="text-status-warning-text shrink-0" />
+
+    <!-- Message + subtitle on one line -->
+    <p class="m-0 min-w-0 flex-1 truncate text-sm">
+      <strong class="font-semibold">{{ getTrialPeriodMessage() }}</strong>
+      <span class="mx-1 opacity-60">·</span>
+      <span>{{ t("billing.upgradeToPlanMessage") }}</span>
+    </p>
+
+    <!-- CTA button -->
+    <OButton
+      v-if="currentPage != 'billing'"
+      variant="warning"
+      size="xs"
+      class="shrink-0"
+      @click="redirectBilling"
+      >{{ t("billing.upgradeNow") }}</OButton
+    >
+    <OButton v-else variant="warning" size="xs" class="shrink-0" @click="redirectContactSupport">{{
+      t("billing.contactSupport")
+    }}</OButton>
+  </div>
+</template>
+
+<script lang="ts">
+// @ts-ignore
+import { defineComponent, ref, onMounted } from "vue";
+import { useI18nTyped } from "@/types/i18n";
+import { useStore } from "vuex";
+import { useRouter } from "vue-router";
+import config from "@/aws-exports";
+import { siteURL } from "@/constants/config";
+import { getDueDays } from "@/utils/zincutils";
+import BillingService from "@/services/billings";
+import OButton from "@/lib/core/Button/OButton.vue";
+import OIcon from "@/lib/core/Icon/OIcon.vue";
+
+export default defineComponent({
+  name: "TrialPeriod",
+  components: { OButton, OIcon },
+  props: ["currentPage"],
+  methods: {
+    getTrialPeriodMessage() {
+      if (
+        Object.hasOwn(
+          this.store.state.organizationData.organizationSettings,
+          "free_trial_expiry",
+        ) &&
+        this.store.state.organizationData.organizationSettings.free_trial_expiry != "" &&
+        this.store.state.organizationData.organizationSettings.free_trial_expiry != null
+      ) {
+        let dueDays = this.getDueDays(
+          this.store.state.organizationData.organizationSettings.free_trial_expiry,
+        );
+        if (dueDays >= 0) {
+          return this.t("billing.trialDaysRemaining", { count: dueDays }, dueDays);
+        } else {
+          return this.t("billing.trialPeriodHasExpired");
+        }
+      }
+      return undefined;
+    },
+  },
+  setup() {
+    const { t } = useI18nTyped();
+    const store = useStore();
+    const router: any = useRouter();
+
+    const hasTrialExpiry =
+      Object.hasOwn(store.state.organizationData.organizationSettings, "free_trial_expiry") &&
+      store.state.organizationData.organizationSettings.free_trial_expiry != "" &&
+      store.state.organizationData.organizationSettings.free_trial_expiry != null;
+
+    const showTrialPeriodMsg = ref(hasTrialExpiry);
+
+    // Check if org is on AWS billing - don't show trial message for AWS orgs
+    onMounted(async () => {
+      try {
+        if (config.isCloud === "true") {
+          const res = await BillingService.list_subscription(
+            store.state.selectedOrganization.identifier,
+          );
+          if (res.data?.provider === "aws") {
+            // AWS billing - don't show trial period message
+            showTrialPeriodMsg.value = false;
+          }
+        }
+      } catch (e) {
+        // If fetch fails, keep the default behavior
+        console.error("Failed to fetch billing info:", e);
+      }
+    });
+
+    const redirectBilling = () => {
+      router.push("/billings/plans/");
+    };
+
+    const redirectContactSupport = () => {
+      window.open(siteURL.contactSupport, "_blank");
+    };
+
+    return {
+      t,
+      store,
+      router,
+      config,
+      redirectBilling,
+      getDueDays,
+      showTrialPeriodMsg,
+      redirectContactSupport,
+    };
+  },
+});
+</script>

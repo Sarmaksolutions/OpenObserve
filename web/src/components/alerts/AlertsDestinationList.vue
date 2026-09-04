@@ -1,0 +1,919 @@
+﻿<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <div class="flex h-full flex-col p-0">
+    <OPageLayout
+      bleed
+      v-if="!showDestinationEditor && !showImportDestination"
+      :title="t('alerts.header')"
+      title-data-test="alert-destinations-list-title"
+      icon="shield-alert-outline"
+      :subtitle="t('alerts.subtitle')"
+      tabs-below
+    >
+      <template #header-tabs>
+        <AlertSectionTabs />
+      </template>
+
+      <template #actions>
+        <OButton
+          variant="outline"
+          size="sm"
+          @click="importDestination"
+          data-test="destination-import"
+          >{{ t(`dashboard.import`) }}</OButton
+        >
+        <OButton
+          data-test="alert-destination-list-add-alert-btn"
+          variant="primary"
+          size="sm"
+          icon-left="add"
+          :disabled="!templates.length"
+          @click="editDestination(null)"
+          >{{ t(`alert_destinations.add`) }}</OButton
+        >
+      </template>
+      <div class="bg-card-glass-bg min-h-0 flex-1">
+        <OTable
+          data-test="alert-destinations-list-table"
+          :data="visibleRows"
+          :columns="columns"
+          row-key="name"
+          :loading="loading"
+          :selected-ids="selectedDestinationIds"
+          selection="multiple"
+          pagination="client"
+          :page-size="20"
+          :page-size-options="[5, 10, 20, 50, 100]"
+          :footer-title="t('alert_destinations.header')"
+          sorting="client"
+          :default-columns="false"
+          :enable-column-resize="true"
+          :persist-columns="true"
+          table-id="settings-alert-destinations"
+          show-index
+          :show-global-filter="false"
+          @update:selected-ids="handleSelectedIdsUpdate"
+        >
+          <template #toolbar>
+            <div class="flex w-full items-center gap-2">
+              <OToggleGroup
+                :model-value="activeTab"
+                @update:model-value="
+                  (v) => {
+                    activeTab = v as 'all' | 'prebuilt' | 'custom';
+                  }
+                "
+                data-test="destination-list-tabs"
+              >
+                <OToggleGroupItem value="all" size="sm" data-test="destination-tab-all">
+                  <template #icon-left><OIcon name="format-list-bulleted" size="sm" /></template>
+                  {{ t("alert_destinations.filterAll") }}
+                </OToggleGroupItem>
+                <OToggleGroupItem value="prebuilt" size="sm" data-test="destination-tab-prebuilt">
+                  <template #icon-left><OIcon name="auto-awesome" size="sm" /></template>
+                  {{ t("alert_destinations.filterPrebuilt") }}
+                </OToggleGroupItem>
+                <OToggleGroupItem value="custom" size="sm" data-test="destination-tab-custom">
+                  <template #icon-left><OIcon name="settings" size="sm" /></template>
+                  {{ t("alert_destinations.filterCustom") }}
+                </OToggleGroupItem>
+              </OToggleGroup>
+              <OSearchInput
+                v-model="filterQuery"
+                data-test="destination-list-search-input"
+                class="flex-1"
+                :placeholder="t('alert_destinations.search')"
+              />
+            </div>
+          </template>
+          <template #toolbar-trailing>
+            <OButton
+              variant="outline"
+              size="icon-sm"
+              icon-left="refresh"
+              :loading="loading"
+              data-test="alert-destinations-list-refresh-btn"
+              @click="getDestinations"
+            >
+              <OTooltip
+                side="bottom"
+                :content="t('common.refresh')"
+                shortcut-id="alertDestinationsRefresh"
+              />
+            </OButton>
+          </template>
+
+          <template #bottom="{ totalRows }">
+            <span class="text-xs font-normal">
+              {{ totalRows.toLocaleString() }} {{ t("alert_destinations.header") }}
+            </span>
+            <OButton
+              v-if="selectedDestinations.length > 0"
+              data-test="destination-list-delete-destinations-btn"
+              variant="outline-destructive"
+              size="sm"
+              :loading="bulkDeleteLoading"
+              @click="openBulkDeleteDialog"
+            >
+              <template #icon-left>
+                <OIcon name="delete" size="sm" />
+              </template>
+              {{ t("common.delete") }}
+            </OButton>
+          </template>
+
+          <template #empty>
+            <OEmptyState
+              size="hero"
+              preset="no-alert-destinations"
+              :filtered="!!filterQuery"
+              :actions="[
+                {
+                  id: 'create',
+                  icon: 'add',
+                  titleKey: 'emptyState.noAlertDestinations.action',
+                  descriptionKey: 'emptyState.noAlertDestinations.actionDesc',
+                },
+                {
+                  id: 'import',
+                  icon: 'upload-file',
+                  titleKey: 'emptyState.noAlertDestinations.import',
+                  descriptionKey: 'emptyState.noAlertDestinations.importDesc',
+                },
+              ]"
+              @action="
+                (id) =>
+                  id === 'clear-filters'
+                    ? (filterQuery = '')
+                    : id === 'import'
+                      ? importDestination()
+                      : templates.length && editDestination(null)
+              "
+            />
+          </template>
+
+          <template #cell-template="{ row }">
+            <div
+              v-if="row.template"
+              class="flex min-w-0 items-center gap-2"
+              :data-test="`destination-template-${row.name}`"
+            >
+              <span class="min-w-0 truncate" :title="row.template">{{ row.template }}</span>
+              <OTag
+                v-if="isDefaultPrebuiltTemplate(row)"
+                :data-test="`destination-template-default-badge-${row.name}`"
+                type="templateDefaultFlag"
+                value="default"
+                class="flex-shrink-0"
+              />
+            </div>
+            <span v-else class="text-text-secondary">—</span>
+          </template>
+
+          <template #cell-type="{ row }">
+            <div class="flex items-center gap-2">
+              <template v-if="getPrebuiltTypeName(row)">
+                <OTag
+                  :data-test="`destination-type-badge-${getPrebuiltTypeName(row)?.toLowerCase()}`"
+                  type="destinationKind"
+                  value="prebuilt"
+                  >{{ getPrebuiltTypeName(row) }}</OTag
+                >
+                <OIcon
+                  name="auto-awesome"
+                  size="sm"
+                  :title="t('alerts.prebuiltDestination', { type: getPrebuiltTypeName(row) })"
+                />
+              </template>
+              <template v-else>
+                <OTag
+                  data-test="destination-type-badge-custom"
+                  type="destinationKind"
+                  value="custom"
+                  >{{ getCustomDestinationLabel(row) }}</OTag
+                >
+                <OIcon name="settings" size="sm" :title="getCustomDestinationLabel(row)" />
+              </template>
+            </div>
+          </template>
+
+          <template #cell-actions="{ row }">
+            <div class="flex items-center justify-center gap-1">
+              <OButton
+                data-test="destination-export"
+                data-row-action="export"
+                variant="ghost"
+                size="icon-sm"
+                :title="t('alert_destinations.exportDestination')"
+                @click.stop="exportDestination(row)"
+              >
+                <OIcon name="download" size="sm" />
+              </OButton>
+              <OButton
+                :data-test="`alert-destination-list-${row.name}-update-destination`"
+                data-row-action="edit"
+                variant="ghost"
+                size="icon-sm"
+                :title="t('alert_destinations.edit')"
+                @click="editDestination(row)"
+              >
+                <OIcon name="edit" size="sm" />
+              </OButton>
+              <OButton
+                :data-test="`alert-destination-list-${row.name}-delete-destination`"
+                data-row-action="delete"
+                variant="ghost"
+                size="icon-sm"
+                :title="t('alert_destinations.delete')"
+                :loading="deletingDestinations.has(row.name)"
+                @click="conformDeleteDestination(row)"
+              >
+                <OIcon name="delete" size="sm" />
+              </OButton>
+            </div>
+          </template>
+
+          <template #cell-used_by="{ row }">
+            <DependencyUsageCell
+              :graph="depGraph"
+              :focus="{ kind: 'destination', name: row.name }"
+              @deleted="onDependencyDeleted"
+            />
+          </template>
+        </OTable>
+      </div>
+    </OPageLayout>
+    <div v-else-if="showDestinationEditor && !showImportDestination" class="min-h-0 flex-1">
+      <AddDestination
+        :is-alerts="true"
+        :destination="editingDestination"
+        :templates="templates"
+        @cancel:hideform="toggleDestinationEditor"
+        @get:destinations="getDestinations"
+      />
+    </div>
+    <div v-else class="min-h-0 flex-1">
+      <ImportDestination
+        :destinations="destinations"
+        :templates="templates"
+        @update:destinations="getDestinations"
+      />
+    </div>
+
+    <ConfirmDialog
+      :title="t('alert_destinations.deleteDestinationTitle')"
+      :message="t('alert_destinations.deleteDestinationMessage')"
+      @update:ok="deleteDestination"
+      @update:cancel="cancelDeleteDestination"
+      v-model="confirmDelete.visible"
+    />
+
+    <ConfirmDialog
+      :title="t('alert_destinations.deleteDestinationsTitle')"
+      :message="t('alerts.confirmDeleteDestinations', { count: selectedDestinations.length })"
+      @update:ok="bulkDeleteDestinations"
+      @update:cancel="confirmBulkDelete = false"
+      v-model="confirmBulkDelete"
+    />
+  </div>
+</template>
+<script lang="ts">
+import { ref, onBeforeMount, onActivated, watch, defineComponent, onMounted, computed } from "vue";
+import type { Ref } from "vue";
+import { useI18nTyped } from "@/types/i18n";
+import OEmptyState from "@/lib/core/EmptyState/OEmptyState.vue";
+import { getImageURL } from "@/utils/zincutils";
+import AddDestination from "./AddDestination.vue";
+import destinationService from "@/services/alert_destination";
+import templateService from "@/services/alert_templates";
+import { useStore } from "vuex";
+import ConfirmDialog from "../ConfirmDialog.vue";
+import { useRouter } from "vue-router";
+import type { DestinationPayload } from "@/ts/interfaces";
+import { usePrebuiltDestinations } from "@/composables/usePrebuiltDestinations";
+import type { Template } from "@/ts/interfaces/index";
+
+import ImportDestination from "./ImportDestination.vue";
+import DependencyUsageCell from "./DependencyUsageCell.vue";
+import useDependencyGraph, {
+  invalidateDependencyGraphCache,
+  applyDependencyDeletion,
+  depNodeId,
+} from "@/composables/alerts/useDependencyGraph";
+import type { DepNodeKind } from "@/composables/alerts/useDependencyGraph";
+import { useReo } from "@/services/reodotdev_analytics";
+import OIcon from "@/lib/core/Icon/OIcon.vue";
+import OButton from "@/lib/core/Button/OButton.vue";
+import OTooltip from "@/lib/overlay/Tooltip/OTooltip.vue";
+import OSearchInput from "@/lib/forms/SearchInput/OSearchInput.vue";
+import OTag from "@/lib/core/Badge/OTag.vue";
+import OTable from "@/lib/core/Table/OTable.vue";
+import OToggleGroup from "@/lib/core/ToggleGroup/OToggleGroup.vue";
+import OToggleGroupItem from "@/lib/core/ToggleGroup/OToggleGroupItem.vue";
+import OPageLayout from "@/lib/core/PageLayout/OPageLayout.vue";
+import AlertSectionTabs from "@/components/alerts/AlertSectionTabs.vue";
+import type { OTableColumnDef } from "@/lib/core/Table/OTable.types";
+import { toast } from "@/lib/feedback/Toast/useToast";
+import { useShortcuts } from "@/lib/vue-shortcut-manager";
+import { focusSearchInput, isInputFocused } from "@/utils/keyboardShortcuts";
+import { COL } from "@/lib/core/Table/OTable.types";
+
+interface ConformDelete {
+  visible: boolean;
+  data: any;
+}
+export default defineComponent({
+  name: "PageAlerts",
+  components: {
+    OIcon,
+    AddDestination,
+    OEmptyState,
+    ConfirmDialog,
+    ImportDestination,
+    OButton,
+    OTooltip,
+    OSearchInput,
+    OTag,
+    OTable,
+    OToggleGroup,
+    OToggleGroupItem,
+    OPageLayout,
+    AlertSectionTabs,
+    DependencyUsageCell,
+  },
+  setup() {
+    const store = useStore();
+    const editingDestination: Ref<DestinationPayload | null> = ref(null);
+    const { t } = useI18nTyped();
+    const { graph: depGraph, loadGraph: loadDepGraph } = useDependencyGraph();
+    const { track } = useReo();
+
+    const { detectPrebuiltType, availableTypes } = usePrebuiltDestinations();
+
+    // Email destinations store recipients in emails[], not url. Method is HTTP-only.
+    const destinationUrl = (row: DestinationPayload): string =>
+      row.type === "email" ? (row.emails ?? []).join(", ") : (row.url ?? "");
+    const destinationMethod = (row: DestinationPayload): string =>
+      row.type === "email" ? "" : (row.method ?? "");
+
+    const columns: OTableColumnDef[] = [
+      {
+        id: "name",
+        header: t("alert_destinations.name"),
+        accessorKey: "name",
+        sortable: true,
+        resizable: true,
+        hideable: true,
+        size: COL.name,
+        minSize: 320,
+        meta: { align: "left", flex: true },
+      },
+      {
+        id: "type",
+        header: t("common.type"),
+        accessorKey: "type",
+        sortable: true,
+        resizable: true,
+        hideable: true,
+        size: 170,
+        meta: { align: "left" },
+      },
+      {
+        id: "url",
+        header: t("alert_destinations.urlOrRecipients"),
+        accessorFn: destinationUrl,
+        resizable: true,
+        hideable: true,
+        size: COL.url,
+        meta: { align: "left" },
+      },
+      {
+        id: "template",
+        header: t("alert_destinations.template"),
+        accessorKey: "template",
+        sortable: true,
+        resizable: true,
+        hideable: true,
+        size: COL.template,
+        meta: { align: "left" },
+      },
+      {
+        id: "method",
+        header: t("alert_destinations.method"),
+        accessorFn: destinationMethod,
+        sortable: true,
+        resizable: true,
+        hideable: true,
+        size: COL.method,
+        meta: { align: "left" },
+      },
+      {
+        id: "used_by",
+        header: t("alert_dependencies.usedByColumn"),
+        cell: " ",
+        sortable: false,
+        resizable: true,
+        hideable: true,
+        size: 200,
+        meta: { align: "left" },
+      },
+      {
+        id: "actions",
+        header: t("alert_destinations.actions"),
+        isAction: true,
+        pinned: "right",
+        size: 130,
+        meta: { align: "center", actionCount: 3 },
+      },
+    ];
+    const destinations: Ref<DestinationPayload[]> = ref([]);
+    const templates: Ref<Template[]> = ref([{ name: "test", body: "", type: "http" }]);
+    const confirmDelete: Ref<ConformDelete> = ref({
+      visible: false,
+      data: null,
+    });
+    const confirmBulkDelete = ref<boolean>(false);
+    const bulkDeleteLoading = ref(false);
+    const selectedDestinations = ref<any[]>([]);
+    const showDestinationEditor = ref(false);
+    const showImportDestination = ref(false);
+    const router = useRouter();
+    const filterQuery = ref("");
+    const resultTotal = ref(0);
+    const deletingDestinations = ref(new Set<string>());
+
+    const selectedDestinationIds = computed(() =>
+      selectedDestinations.value.map((d: any) => d.name),
+    );
+
+    const handleSelectedIdsUpdate = (ids: string[]) => {
+      const map = new Map(destinations.value.map((r: any) => [r.name, r]));
+      selectedDestinations.value = ids.map((id: any) => map.get(id)).filter(Boolean);
+    };
+
+    onActivated(() => {
+      getTemplates();
+      if (!destinations.value.length) getDestinations();
+    });
+    onBeforeMount(() => {
+      getDestinations();
+      getTemplates();
+    });
+
+    watch(
+      () => router.currentRoute.value.query.action,
+      (action) => {
+        if (!action) {
+          showDestinationEditor.value = false;
+          showImportDestination.value = false;
+        }
+      },
+    );
+
+    onMounted(() => {
+      updateRoute();
+    });
+
+    // A delete is one row leaving a list the server has already confirmed. Splice
+    // it out and prune the shared dependency graph rather than refetching: a
+    // refetch blanks the table behind its spinner and a "please wait" toast, which
+    // reads as a page reload, and takes the user's scroll and page with it.
+    const dropDestinations = (names: string[]) => {
+      if (!names.length) return;
+      const gone = new Set(names);
+      destinations.value = destinations.value.filter((d: any) => !gone.has(d.name));
+      // Anything that failed to delete stays selected, so a bulk retry is one click.
+      selectedDestinations.value = selectedDestinations.value.filter((d: any) => !gone.has(d.name));
+      const org = store.state.selectedOrganization.identifier;
+      for (const name of gone)
+        depGraph.value = applyDependencyDeletion(
+          org,
+          depNodeId("destination", name),
+          depGraph.value,
+        );
+    };
+
+    // Deleting an alert in the impact dialog leaves this list's rows untouched, so
+    // re-read the (already pruned) shared graph for the Used by counts instead of
+    // reloading the page's data.
+    const onDependencyDeleted = (kind: DepNodeKind) => {
+      if (kind === "destination") getDestinations();
+      else loadDepGraph(store.state.selectedOrganization.identifier);
+    };
+
+    const loading = ref(false);
+    const getDestinations = () => {
+      const dismiss = toast({
+        variant: "loading",
+        message: t("toastMessages.alerts.pleaseWaitWhileLoadingDestinations"),
+        timeout: 0,
+      });
+      loading.value = true;
+      destinationService
+        .list({
+          page_num: 1,
+          page_size: 100000,
+          sort_by: "name",
+          desc: false,
+          org_identifier: store.state.selectedOrganization.identifier,
+          module: "alert",
+        })
+        .then((res) => {
+          res.data = res.data.filter(
+            (destination: any) => destination.type == "http" || destination.type == "email",
+          );
+          resultTotal.value = res.data.length;
+          destinations.value = res.data;
+          // Any destination add/edit/delete lands here on refresh — drop the
+          // shared dependency-graph cache and rebuild it so the "Used by" counts
+          // (and the impact dialog) are current.
+          invalidateDependencyGraphCache();
+          loadDepGraph(store.state.selectedOrganization.identifier);
+          updateRoute();
+        })
+        .catch((err) => {
+          if (err.response.status != 403) {
+            toast({
+              variant: "error",
+              message: t("toastMessages.alerts.errorWhilePullingDestinations"),
+            });
+          }
+          dismiss();
+        })
+        .finally(() => {
+          dismiss();
+          loading.value = false;
+        });
+    };
+    const getTemplates = () => {
+      templateService
+        .list({
+          org_identifier: store.state.selectedOrganization.identifier,
+        })
+        .then((res) => (templates.value = res.data));
+    };
+    const updateRoute = () => {
+      if (router.currentRoute.value.query.action === "add") editDestination(null);
+      if (router.currentRoute.value.query.action === "update")
+        editDestination(getDestinationByName(router.currentRoute.value.query.name as string));
+      if (router.currentRoute.value.query.action === "import") showImportDestination.value = true;
+    };
+    const getDestinationByName = (name: string) => {
+      return destinations.value.find((destination) => destination.name === name);
+    };
+    const editDestination = (destination: any) => {
+      if (!destination) {
+        track("Button Click", {
+          button: "Add Destination",
+          page: "Alert Destinations",
+        });
+      }
+      toggleDestinationEditor();
+      resetEditingDestination();
+      if (!destination) {
+        router.push({
+          name: "alertDestinations",
+          query: {
+            action: "add",
+            org_identifier: store.state.selectedOrganization.identifier,
+          },
+        });
+      } else {
+        editingDestination.value = { ...destination };
+        router.push({
+          name: "alertDestinations",
+          query: {
+            action: "update",
+            name: destination.name,
+            org_identifier: store.state.selectedOrganization.identifier,
+          },
+        });
+      }
+    };
+    const resetEditingDestination = () => {
+      editingDestination.value = null;
+    };
+    const deleteDestination = () => {
+      const name = confirmDelete.value?.data?.name;
+      if (!name) return;
+      deletingDestinations.value.add(name);
+      destinationService
+        .delete({
+          org_identifier: store.state.selectedOrganization.identifier,
+          destination_name: name,
+        })
+        .then(() => {
+          toast({
+            variant: "success",
+            message: t("toastMessages.alerts.destinationDeletedSuccessfully", { name }),
+          });
+          dropDestinations([name]);
+        })
+        .catch((err: any) => {
+          // A network failure has no `err.response` at all, and a non-409 code used
+          // to fall through silently; the row stays either way, so it has to say why.
+          if (err?.response?.status === 403) return;
+          const message =
+            err?.response?.data?.message ||
+            err?.response?.data?.error ||
+            t("alerts.messages.deleteDestinationFailed");
+          toast({ variant: "error", message });
+        })
+        .finally(() => {
+          deletingDestinations.value.delete(name);
+        });
+    };
+    const conformDeleteDestination = (destination: any) => {
+      confirmDelete.value.visible = true;
+      confirmDelete.value.data = destination;
+    };
+    const cancelDeleteDestination = () => {
+      confirmDelete.value.visible = false;
+      confirmDelete.value.data = null;
+    };
+    const toggleDestinationEditor = () => {
+      showDestinationEditor.value = !showDestinationEditor.value;
+      if (!showDestinationEditor.value)
+        router.push({
+          name: "alertDestinations",
+          query: {
+            org_identifier: store.state.selectedOrganization.identifier,
+          },
+        });
+    };
+    const filterData = (rows: any, terms: any) => {
+      var filtered = [];
+      terms = terms.toLowerCase();
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i]["name"].toLowerCase().includes(terms)) {
+          filtered.push(rows[i]);
+        }
+      }
+      return filtered;
+    };
+
+    const routeTo = (name: string) => {
+      router.push({
+        name: name,
+        query: {
+          action: "add",
+          org_identifier: store.state.selectedOrganization.identifier,
+        },
+      });
+    };
+
+    const exportDestination = (row: any) => {
+      const findDestination: any = getDestinationByName(row.name);
+      const destinationByName = { ...findDestination };
+      const destinationJson = JSON.stringify(destinationByName, null, 2);
+      const blob = new Blob([destinationJson], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${destinationByName.name}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+    };
+    const importDestination = () => {
+      showImportDestination.value = true;
+      router.push({
+        name: "alertDestinations",
+        query: {
+          action: "import",
+          org_identifier: store.state.selectedOrganization.identifier,
+        },
+      });
+    };
+
+    // True when the row's template name matches the canonical `prebuilt_<type>`
+    // for its detected prebuilt type — i.e. the user kept the default rather
+    // than picking a custom template. Used to show a "Default" badge.
+    const isDefaultPrebuiltTemplate = (destination: any): boolean => {
+      const prebuiltType = detectPrebuiltType(destination);
+      if (!prebuiltType) return false;
+      return destination.template === `prebuilt_${prebuiltType}`;
+    };
+
+    const getPrebuiltTypeName = (destination: DestinationPayload): string | null => {
+      const prebuiltType = detectPrebuiltType(destination);
+      if (!prebuiltType) return null;
+
+      const typeConfig = availableTypes.value.find((t) => t.id === prebuiltType);
+      return typeConfig ? typeConfig.name : prebuiltType;
+    };
+
+    const getCustomDestinationLabel = (destination: DestinationPayload): string => {
+      if (destination.type === "http") {
+        return t("alert_destinations.customWebhook");
+      } else if (destination.type === "email") {
+        return t("alert_destinations.customEmail");
+      }
+      return t("alert_destinations.custom");
+    };
+
+    // Top-right tab filter — mirrors the alerts list and templates list.
+    // "prebuilt" matches any destination detectable as a prebuilt type
+    // (Slack/Opsgenie/PagerDuty/ServiceNow/etc., identified via the
+    // `prebuilt_type` metadata or URL/template pattern); "custom" is the
+    // negation, capturing user-defined HTTP/Email destinations.
+    const activeTab = ref<"all" | "prebuilt" | "custom">("all");
+
+    const visibleRows = computed(() => {
+      const base = destinations.value || [];
+      const byTab =
+        activeTab.value === "prebuilt"
+          ? base.filter((d: any) => !!detectPrebuiltType(d))
+          : activeTab.value === "custom"
+            ? base.filter((d: any) => !detectPrebuiltType(d))
+            : base;
+      if (!filterQuery.value) return byTab;
+      return filterData(byTab, filterQuery.value);
+    });
+
+    const openBulkDeleteDialog = () => {
+      confirmBulkDelete.value = true;
+    };
+
+    const bulkDeleteDestinations = async () => {
+      bulkDeleteLoading.value = true;
+      const dismiss = toast({
+        variant: "loading",
+        message: t("toastMessages.alerts.deletingDestinations"),
+        timeout: 0,
+      });
+
+      try {
+        if (selectedDestinations.value.length === 0) {
+          toast({
+            variant: "error",
+            message: t("toastMessages.alerts.noDestinationsSelectedForDeletion"),
+          });
+          dismiss();
+          return;
+        }
+
+        const payload = {
+          ids: selectedDestinations.value.map((d: any) => d.name),
+        };
+
+        const response = await destinationService.bulkDelete(
+          store.state.selectedOrganization.identifier,
+          payload,
+        );
+
+        dismiss();
+
+        if (response.data) {
+          const { successful = [], unsuccessful = [] } = response.data;
+          const successCount = successful.length;
+          const failCount = unsuccessful.length;
+
+          if (failCount > 0 && successCount > 0) {
+            toast({
+              variant: "warning",
+              message: t("toastMessages.alerts.destinationsDeletedWithFailures", {
+                count: successCount,
+                failed: failCount,
+              }),
+              timeout: 5000,
+            });
+          } else if (failCount > 0) {
+            toast({
+              variant: "error",
+              message: t("toastMessages.alerts.failedToDeleteDestinations", { count: failCount }),
+            });
+          } else {
+            toast({
+              variant: "success",
+              message: t("toastMessages.alerts.destinationsDeletedSuccessfully", {
+                count: successCount,
+              }),
+            });
+          }
+        } else {
+          toast({
+            variant: "success",
+            message: t("toastMessages.alerts.destinationsDeletedSuccessfully", {
+              count: selectedDestinations.value.length,
+            }),
+          });
+        }
+
+        // An unrecognised shape is NOT taken as "all of them" — splicing rows the
+        // server may have kept would show a delete that never happened.
+        if (Array.isArray(response.data?.successful)) {
+          dropDestinations(response.data.successful.map((entry: any) => entry?.name ?? entry));
+        } else {
+          selectedDestinations.value = [];
+          getDestinations();
+        }
+      } catch (error: any) {
+        dismiss();
+        const errorMessage =
+          error.response?.data?.message ||
+          error?.message ||
+          t("alerts.messages.bulkDeleteDestinationsFailed");
+        if (error.response?.status != 403 || error?.status != 403) {
+          toast({
+            variant: "error",
+            message: errorMessage,
+          });
+        }
+      } finally {
+        bulkDeleteLoading.value = false;
+      }
+
+      confirmBulkDelete.value = false;
+    };
+
+    watch(
+      visibleRows,
+      (newVisibleRows) => {
+        resultTotal.value = newVisibleRows.length;
+      },
+      { immediate: true },
+    );
+
+    // ── Keyboard shortcuts ────────────────────────────────────────────────
+    useShortcuts([
+      {
+        id: "alertDestinationsAdd",
+        handler: () => {
+          if (!isInputFocused()) editDestination(null);
+        },
+      },
+      {
+        id: "alertDestinationsRefresh",
+        handler: () => {
+          if (!isInputFocused()) getDestinations();
+        },
+      },
+      {
+        id: "alertDestinationsFocusSearch",
+        handler: () => {
+          focusSearchInput("destination-list-search-input");
+        },
+      },
+    ]);
+    return {
+      t,
+      depGraph,
+      showDestinationEditor,
+      destinations,
+      columns,
+      editDestination,
+      getImageURL,
+      loading,
+      conformDeleteDestination,
+      filterQuery,
+      filterData,
+      editingDestination,
+      templates,
+      toggleDestinationEditor,
+      getDestinations,
+      onDependencyDeleted,
+      deletingDestinations,
+      deleteDestination,
+      cancelDeleteDestination,
+      confirmDelete,
+      resultTotal,
+      routeTo,
+      exportDestination,
+      showImportDestination,
+      importDestination,
+      store,
+      getTemplates,
+      updateRoute,
+      getDestinationByName,
+      resetEditingDestination,
+      visibleRows,
+      activeTab,
+      selectedDestinationIds,
+      handleSelectedIdsUpdate,
+      openBulkDeleteDialog,
+      bulkDeleteDestinations,
+      confirmBulkDelete,
+      bulkDeleteLoading,
+      selectedDestinations,
+      getPrebuiltTypeName,
+      getCustomDestinationLabel,
+      isDefaultPrebuiltTemplate,
+    };
+  },
+});
+</script>

@@ -1,0 +1,119 @@
+<template>
+  <!-- Flow content: OTable's hover-action toolbar owns the surface and the
+       positioning, so this is just the button row. -->
+  <div
+    class="field_overlay table-cell-actions flex items-center"
+    :title="cellValue"
+    :data-test="`log-add-data-from-column-${cellValue}`"
+  >
+    <span class="mx-1">
+      <OButton
+        variant="ghost"
+        size="icon-xs-circle"
+        @click.prevent.stop="copyLogToClipboard(cellValue)"
+        :title="t('logs.cellActions.copy')"
+      >
+        <OIcon name="content-copy" size="xs" />
+      </OButton>
+    </span>
+    <span v-if="isStreamField && !hideSearchTermActions" class="me-1">
+      <OButton
+        variant="ghost"
+        size="icon-xs-circle"
+        @click.prevent.stop="addSearchTerm(column.id, cellValue, 'include')"
+        :data-test="`log-details-include-field-${cellValue}`"
+        :title="t('logs.cellActions.includeTerm')"
+      >
+        <OIcon name="" style="height: 0.5rem; width: 0.5rem">
+          <EqualIcon class="size-full" />
+        </OIcon>
+      </OButton>
+    </span>
+    <span v-if="isStreamField && !hideSearchTermActions" class="me-1">
+      <OButton
+        variant="ghost"
+        size="icon-xs-circle"
+        @click.prevent.stop="addSearchTerm(column.id, cellValue, 'exclude')"
+        :title="t('logs.cellActions.excludeTerm')"
+        :data-test="`log-details-exclude-field-${cellValue}`"
+      >
+        <OIcon name="" style="height: 0.5rem; width: 0.5rem">
+          <NotEqualIcon class="size-full" />
+        </OIcon>
+      </OButton>
+    </span>
+    <!-- o2 ai context add button in the cell actions when user adds a interesting field to the table 
+     then we show some options there we need this  -->
+    <O2AIContextAddBtn
+      v-if="!hideAi"
+      @send-to-ai-chat="sendToAiChat(JSON.stringify(cellValue))"
+      class="size-6! border border-solid border-white"
+      :imageHeight="'14'"
+      :imageWidth="'14'"
+    />
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed } from "vue";
+import type { PropType } from "vue";
+import { useI18nTyped } from "@/types/i18n";
+import EqualIcon from "@/components/icons/EqualIcon.vue";
+import NotEqualIcon from "@/components/icons/NotEqualIcon.vue";
+import O2AIContextAddBtn from "@/components/common/O2AIContextAddBtn.vue";
+import OButton from "@/lib/core/Button/OButton.vue";
+import OIcon from "@/lib/core/Icon/OIcon.vue";
+
+const props = defineProps({
+  column: {
+    type: Object,
+    required: true,
+  },
+  row: {
+    type: Object,
+    required: true,
+  },
+  selectedStreamFields: {
+    type: Array as PropType<Array<{ name: string; isSchemaField: boolean }>>,
+    required: true,
+    default: () => [],
+  },
+  hideSearchTermActions: {
+    type: Boolean,
+    default: false,
+  },
+  hideAi: {
+    type: Boolean,
+    default: false,
+  },
+  /** Rendered cell value, for columns with nothing under `row[column.id]` (logs' `source`). */
+  value: {
+    type: null as unknown as PropType<unknown>,
+    default: undefined,
+  },
+});
+
+const cellValue = computed(() =>
+  props.value === undefined ? props.row[props.column.id] : props.value,
+);
+
+const { t } = useI18nTyped();
+
+const emit = defineEmits(["copy", "addSearchTerm", "addFieldToTable", "sendToAiChat"]);
+
+const copyLogToClipboard = (value: any) => {
+  emit("copy", value);
+};
+const addSearchTerm = (field: string, field_value: string | number | boolean, action: string) => {
+  emit("addSearchTerm", field, field_value, action);
+};
+
+const sendToAiChat = (value: any) => {
+  emit("sendToAiChat", value);
+};
+
+const isStreamField = computed(() => {
+  const field: any = props.selectedStreamFields?.find((item: any) => item.name === props.column.id);
+  return field?.isSchemaField ?? false;
+});
+</script>

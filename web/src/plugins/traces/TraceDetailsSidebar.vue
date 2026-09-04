@@ -1,0 +1,2549 @@
+﻿<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <div class="trace-details-sidebar flex h-full flex-col">
+    <div
+      class="px-page-edge border-b-card-glass-border bg-surface-panel flex h-8 items-center justify-start border-b border-solid"
+      data-test="trace-details-sidebar-header"
+    >
+      <div
+        :title="span.operation_name"
+        class="flex w-[calc(100%-1.5rem)] items-center truncate ps-1 pb-0"
+        data-test="trace-details-sidebar-header-operation-name"
+      >
+        <!-- Status Code Badge -->
+        <span
+          v-if="hasSpanError"
+          class="inline-flex items-center"
+          data-test="trace-details-sidebar-header-toolbar-status-code"
+        >
+          <OIcon name="error" size="sm" class="text-status-error-text! me-1" />
+        </span>
+        <!-- Observation Type Badge (for LLM spans) -->
+        <OTag
+          v-if="isLLMSpan"
+          type="observationType"
+          :value="span.gen_ai_operation_name"
+          class="me-1 normal-case!"
+          data-test="trace-details-sidebar-observation-badge"
+          >{{
+            span.gen_ai_operation_name?.charAt(0) +
+            span.gen_ai_operation_name?.slice(1).toLowerCase()
+          }}</OTag
+        >
+
+        <span class="truncate">{{ span.operation_name }}</span>
+      </div>
+
+      <OButton
+        variant="ghost"
+        size="icon"
+        @click="closeSidebar"
+        data-test="trace-details-sidebar-header-close-btn"
+      >
+        <OIcon name="close" size="xs" />
+      </OButton>
+    </div>
+    <div
+      class="trace-details-toolbar-container bg-surface-panel/50 whitespace-nowrap"
+      data-test="trace-details-sidebar-header-toolbar"
+    >
+      <!-- Row 1: Trace Details -->
+      <div class="flex flex-nowrap items-center justify-between overflow-x-auto p-1">
+        <div class="flex flex-nowrap items-center">
+          <!-- Service Badge -->
+          <OTag
+            type="metricChip"
+            class="text-2xs bg-surface-base border-border-default border-s-badge-blue-ol-border hover:bg-surface-panel me-[0.325rem] h-5.5 shrink-0 border border-s-[0.1875rem] border-solid px-1.5 transition-all duration-200 hover:-translate-y-px"
+            :title="span.service_name"
+            data-test="trace-details-sidebar-header-toolbar-service"
+          >
+            <template #icon>
+              <img :src="serviceIconUrl" class="h-3.5 w-3.5 shrink-0" aria-hidden="true" alt="" />
+            </template>
+            <span class="text-3xs text-text-secondary me-0.75 font-medium">{{
+              t("traces.traceDetailsSidebar.service")
+            }}</span>
+            <span
+              class="text-3xs text-text-body font-semibold"
+              data-test="trace-details-sidebar-header-toolbar-service-name"
+            >
+              {{ span.service_name }}
+            </span>
+          </OTag>
+
+          <!-- Duration Badge -->
+          <OTag
+            type="metricChip"
+            class="text-2xs bg-surface-base border-border-default border-s-badge-indigo-ol-border hover:bg-surface-panel me-[0.325rem] h-5.5 shrink-0 border border-s-[0.1875rem] border-solid px-1.5 transition-all duration-200 hover:-translate-y-px"
+            :title="getDuration"
+            data-test="trace-details-sidebar-header-toolbar-duration"
+          >
+            <template #icon><OIcon name="schedule" size="xs" /></template>
+            <span class="text-3xs text-text-secondary me-0.75 font-medium">{{
+              t("traces.traceDetailsSidebar.duration")
+            }}</span>
+            <span class="text-3xs text-text-body font-semibold">{{ getDuration }}</span>
+          </OTag>
+
+          <!-- TTFT Badge -->
+          <OTag
+            v-if="getTTFT"
+            type="metricChip"
+            class="text-2xs bg-surface-base border-border-default border-s-badge-purple-ol-border hover:bg-surface-panel me-[0.325rem] h-5.5 shrink-0 border border-s-[0.1875rem] border-solid px-1.5 transition-all duration-200 hover:-translate-y-px"
+            :title="getTTFT"
+            data-test="trace-details-sidebar-header-toolbar-ttft"
+          >
+            <template #icon><OIcon name="speed" size="xs" /></template>
+            <span class="text-3xs text-text-secondary me-0.75 font-medium">{{
+              t("traces.traceDetailsSidebar.ttft")
+            }}</span>
+            <span class="text-3xs text-text-body font-semibold">{{ getTTFT }}</span>
+          </OTag>
+
+          <!-- Start Time Badge -->
+          <OTag
+            type="metricChip"
+            class="text-2xs bg-surface-base border-border-default border-s-badge-amber-ol-border hover:bg-surface-panel me-[0.325rem] h-5.5 shrink-0 border border-s-[0.1875rem] border-solid px-1.5 transition-all duration-200 hover:-translate-y-px"
+            :title="getStartTime"
+            data-test="trace-details-sidebar-header-toolbar-start-time"
+          >
+            <template #icon><OIcon name="access-time" size="xs" /></template>
+            <span class="text-3xs text-text-secondary me-0.75 font-medium">{{
+              t("traces.traceDetailsSidebar.start")
+            }}</span>
+            <span class="text-3xs text-text-body font-semibold">{{ getStartTime }}</span>
+          </OTag>
+
+          <!-- Resend Count Badge -->
+          <OTag
+            v-if="spanHttpResendCount"
+            type="metricChip"
+            class="text-2xs bg-surface-base border-border-default hover:bg-surface-panel me-[0.325rem] h-5.5 shrink-0 border border-solid px-1.5 transition-all duration-200 hover:-translate-y-px"
+            :title="t('traces.traceDetailsSidebar.requestResent', { count: spanHttpResendCount })"
+            data-test="trace-details-sidebar-header-toolbar-resend-count"
+          >
+            <template #icon><OIcon name="replay" size="xs" /></template>
+            <span class="text-3xs text-text-secondary me-0.75 font-medium">{{
+              t("traces.traceDetailsSidebar.resends")
+            }}</span>
+            <span class="text-3xs text-text-body font-semibold">{{ spanHttpResendCount }}</span>
+          </OTag>
+        </div>
+
+        <div class="flex items-center">
+          <!-- Span ID Badge -->
+          <OTag
+            type="metricChip"
+            clickable
+            class="group text-2xs bg-surface-base border-border-default border-s-badge-teal-ol-border hover:bg-surface-panel me-[0.325rem] h-5.5 shrink-0 cursor-pointer border border-s-[0.1875rem] border-solid px-1.5 transition-all duration-200 hover:-translate-y-px"
+            :title="t('traces.traceDetailsSidebar.spanIdTitle', { id: span.span_id })"
+            @click="copySpanId"
+            data-test="trace-details-sidebar-header-toolbar-span-id"
+          >
+            <template #icon><OIcon name="tag" size="xs" /></template>
+            <span class="text-3xs text-text-body font-semibold">{{ span.span_id }}</span>
+            <OIcon
+              name="content-copy"
+              size="xs"
+              class="ms-1 opacity-60 transition-opacity duration-200 group-hover:opacity-100"
+              data-test="trace-details-sidebar-header-toolbar-span-id-copy-icon"
+            />
+          </OTag>
+
+          <!-- View Logs Button -->
+          <span v-if="parentMode === 'standalone'" class="shrink-0">
+            <!-- Single button with wrapper for tooltip functionality -->
+            <span class="inline-block" tabindex="0">
+              <OButton
+                variant="outline"
+                size="xs"
+                class="h-full text-xs!"
+                :disabled="isViewLogsDisabled"
+                :loading="config.isEnterprise === 'true' && correlationLoading"
+                @click.stop="viewSpanLogs"
+                data-test="trace-details-sidebar-header-toolbar-view-logs-btn"
+              >
+                {{ t("traces.viewLogs") }}
+              </OButton>
+              <OTooltip :content="viewLogsTooltipContent" />
+            </span>
+          </span>
+
+          <!-- LLM workflow actions — icon-only, matching the trace header. The
+               row itself has no gap (its children carry their own margins), so
+               these three are grouped and spaced on the header's rhythm. -->
+          <div class="ms-2 flex items-center gap-2">
+            <OButton
+              v-if="showEvaluateButton && canPreviewSpan"
+              variant="outline"
+              size="icon-xs"
+              :aria-label="t('onlineEvals.manualEvaluation.titles.span')"
+              data-test="trace-details-sidebar-evaluate-span-btn"
+              @click.stop="evaluateSpan"
+            >
+              <OIcon name="rule" size="sm" />
+              <OTooltip side="bottom" :content="t('onlineEvals.manualEvaluation.titles.span')" />
+            </OButton>
+
+            <TraceAnnotateMenu
+              v-if="showAnnotateButtons"
+              ref-type="span"
+              :ref-id="String(span.span_id ?? '')"
+              :ref-trace-id="String(span.trace_id ?? '')"
+              :ref-trace-start-time="spanStartTimeUs"
+              :source-stream="spanSourceStream"
+              compact
+              data-test="trace-details-sidebar-annotate-span-btn"
+            />
+
+            <OButton
+              v-if="showAnnotateButtons"
+              variant="outline"
+              size="icon-xs"
+              :aria-label="t('aiObservability.traceActions.dataset.button')"
+              data-test="trace-details-sidebar-dataset-span-btn"
+              @click.stop="addSpanToDataset"
+            >
+              <OIcon name="table-chart" size="sm" />
+              <OTooltip side="bottom" :content="t('aiObservability.traceActions.dataset.button')" />
+            </OButton>
+
+            <OButton
+              v-if="canOpenPlayground"
+              variant="outline"
+              size="icon-xs"
+              :aria-label="t('aiObservability.traceActions.playground.button')"
+              data-test="trace-details-sidebar-playground-span-btn"
+              @click.stop="openInPlayground"
+            >
+              <OIcon name="play-circle" size="sm" />
+              <OTooltip
+                side="bottom"
+                :content="t('aiObservability.traceActions.playground.hint')"
+              />
+            </OButton>
+          </div>
+        </div>
+      </div>
+
+      <!-- Row 2: LLM Metrics (conditional) -->
+      <div
+        v-if="isLLMSpan && llmMetrics && span.gen_ai_response_model"
+        class="llm-metrics-row border-border-default flex flex-nowrap items-center justify-between overflow-x-auto border-t border-solid p-1"
+      >
+        <div class="flex flex-nowrap items-center">
+          <!-- Model Chip -->
+          <OTag
+            type="metricChip"
+            icon="psychology"
+            class="text-3xs bg-surface-base border-border-default border-s-badge-purple-ol-border h-5 shrink-0 border border-s-[0.1875rem] border-solid px-1.5 transition-all duration-200 hover:-translate-y-px"
+            :title="span.gen_ai_response_model"
+          >
+            <span class="text-3xs text-badge-purple-ol-text font-semibold">{{
+              span.gen_ai_response_model
+            }}</span>
+          </OTag>
+
+          <!-- Token Usage Group -->
+          <div class="inline-flex shrink-0 gap-0.75">
+            <!-- Input Tokens -->
+            <OTag
+              type="metricChip"
+              class="text-3xs bg-surface-base border-border-default border-s-badge-blue-ol-border text-badge-blue-ol-text h-5 min-w-15 shrink-0 justify-center border border-s-[0.1875rem] border-solid px-1.5 transition-all duration-200 hover:-translate-y-px"
+              :title="t('traces.traceDetailsSidebar.inputTokens')"
+            >
+              <template #icon><OIcon name="arrow-upward" size="xs" /></template>
+              <span class="text-3xs me-0.5 font-medium">{{
+                t("traces.traceDetailsSidebar.in")
+              }}</span>
+              <span class="text-3xs font-medium">{{ llmMetrics.usage.input }}</span>
+            </OTag>
+
+            <!-- Output Tokens -->
+            <OTag
+              type="metricChip"
+              class="text-3xs bg-surface-base border-border-default border-s-badge-success-ol-border text-badge-success-ol-text h-5 min-w-15 shrink-0 justify-center border border-s-[0.1875rem] border-solid px-1.5 transition-all duration-200 hover:-translate-y-px"
+              :title="t('traces.traceDetailsSidebar.outputTokens')"
+            >
+              <template #icon><OIcon name="arrow-downward" size="xs" /></template>
+              <span class="text-3xs me-0.5 font-medium">{{
+                t("traces.traceDetailsSidebar.out")
+              }}</span>
+              <span class="text-3xs font-medium">{{ llmMetrics.usage.output }}</span>
+            </OTag>
+          </div>
+
+          <!-- Cost Chip -->
+          <OTag
+            type="metricChip"
+            icon="attach-money"
+            class="text-3xs bg-surface-base border-border-default border-s-badge-orange-ol-border h-5 shrink-0 border border-s-[0.1875rem] border-solid px-1.5 transition-all duration-200 hover:-translate-y-px"
+            :title="t('traces.traceDetailsSidebar.totalCost')"
+          >
+            <span class="text-3xs text-badge-orange-ol-text font-semibold"
+              >{{ t("traces.sessionDetail.currencySymbol")
+              }}{{ Number(llmMetrics.cost.total).toFixed(5) }}</span
+            >
+          </OTag>
+        </div>
+
+        <div class="flex items-center">
+          <!-- Provider Badge -->
+          <OTag
+            v-if="span.gen_ai_provider_name"
+            type="metricChip"
+            class="text-3xs bg-badge-blue-solid-bg text-badge-blue-solid-text shrink-0 rounded-full px-2 py-0.75 font-semibold tracking-wide uppercase"
+            >{{ span.gen_ai_provider_name }}</OTag
+          >
+        </div>
+      </div>
+    </div>
+
+    <div class="px-page-edge span_details_tabs">
+      <OTabs
+        :model-value="activeTabModel"
+        @update:model-value="$emit('update:activeTab', $event)"
+        dense
+        align="left"
+        data-test="trace-details-sidebar-tabs"
+      >
+        <!-- LLM Preview Tab (conditional - shown first for LLM traces) -->
+        <OTab
+          v-if="canPreviewSpan"
+          name="preview"
+          :label="t('traces.traceDetailsSidebar.preview')"
+          data-test="trace-details-sidebar-tabs-preview"
+          class="font-normal! capitalize"
+        />
+
+        <OTab
+          name="attributes"
+          :label="t('common.attributes')"
+          data-test="trace-details-sidebar-tabs-attributes"
+          class="font-normal! capitalize"
+        />
+        <OTab
+          name="error"
+          data-test="trace-details-sidebar-tabs-error"
+          class="gap-1! font-normal! capitalize"
+        >
+          {{ t("common.error") }}
+          <OTag
+            v-if="hasExceptionEvents.length"
+            type="countChip"
+            value="error"
+            class="ms-0"
+            data-test="trace-details-sidebar-tabs-error-count"
+            >{{ hasExceptionEvents.length }}</OTag
+          >
+        </OTab>
+        <OTab
+          v-if="hasDbSpan"
+          name="database"
+          :label="t('common.db')"
+          class="font-normal! capitalize"
+          data-test="trace-details-sidebar-tabs-database"
+        />
+        <OTab
+          name="events"
+          :label="t('common.events')"
+          data-test="trace-details-sidebar-tabs-events"
+          class="font-normal! capitalize"
+        />
+        <OTab
+          name="links"
+          :label="t('common.links')"
+          data-test="trace-details-sidebar-tabs-links"
+          class="font-normal! capitalize"
+        />
+        <!-- Correlation Tabs (only visible when service streams enabled and enterprise license) -->
+        <OTab
+          v-if="serviceStreamsEnabled && config.isEnterprise === 'true'"
+          name="correlated-logs"
+          :label="t('correlation.correlatedLogs')"
+          data-test="trace-details-sidebar-tabs-correlated-logs"
+          class="font-normal! capitalize"
+        />
+        <OTab
+          v-if="serviceStreamsEnabled && config.isEnterprise === 'true'"
+          name="correlated-metrics"
+          :label="t('correlation.correlatedMetrics')"
+          data-test="trace-details-sidebar-tabs-correlated-metrics"
+          class="font-normal! capitalize"
+        />
+      </OTabs>
+    </div>
+    <OSeparator class="w-full" />
+    <div
+      class="span_details_tab-panels h-[calc(100%-6rem)] overflow-hidden"
+      :class="
+        activeTabModel === 'correlated-logs' || activeTabModel === 'correlated-metrics'
+          ? ''
+          : 'px-page-edge py-2'
+      "
+    >
+      <OTabPanels
+        :model-value="activeTabModel"
+        @update:model-value="$emit('update:activeTab', $event)"
+        grow
+        class="h-full overflow-y-auto"
+      >
+        <!-- LLM Preview Tab Panel -->
+        <OTabPanel v-if="canPreviewSpan" name="preview" class="llm-preview-panel p-3">
+          <div class="llm-preview-container h-full! w-full overflow-hidden overflow-x-auto">
+            <!-- Input and Output Side by Side -->
+            <div
+              class="io-container flex h-full! w-full!"
+              :class="isFullscreen ? 'bg-surface-panel' : ''"
+              ref="ioContainerRef"
+            >
+              <!-- Input Section -->
+              <div
+                class="io-section flex h-full w-1/2 shrink-0 grow-0 basis-[calc(50%-0.4rem)] flex-col pe-2"
+              >
+                <div
+                  class="section-label text-text-heading mb-2 flex items-center justify-between text-sm font-bold"
+                  :class="isFullscreen ? 'bg-surface-panel' : ''"
+                >
+                  <div>{{ t("traces.traceDetailsSidebar.input") }}</div>
+                  <div class="flex items-center gap-1">
+                    <OButton
+                      variant="outline"
+                      size="icon"
+                      :title="
+                        isFullscreen
+                          ? t('traces.traceDetailsSidebar.exitFullscreen')
+                          : t('traces.traceDetailsSidebar.enterFullscreen')
+                      "
+                      @click="toggleFullscreen"
+                    >
+                      <OIcon :name="isFullscreen ? 'fullscreen-exit' : 'fullscreen'" size="xs" />
+                    </OButton>
+                    <OButton
+                      variant="outline"
+                      size="icon"
+                      :title="t('traces.traceDetailsSidebar.copyInput')"
+                      @click="copyContent(previewInput, 'input')"
+                      :disabled="!hasContent(previewInput)"
+                    >
+                      <OIcon name="content-copy" size="xs" />
+                    </OButton>
+                  </div>
+                </div>
+                <div
+                  class="llm-content-box border-card-glass-border rounded-default bg-code-bg h-full max-h-[calc(100%-1.625rem)] flex-1 overflow-x-hidden overflow-y-auto border border-solid p-3"
+                >
+                  <!-- System Instructions (when available) -->
+                  <div v-if="parsedSystemInstructions" class="mb-3">
+                    <OCollapsible
+                      v-model="sysInstrOpen"
+                      icon="settings"
+                      :label="t('traces.traceDetailsSidebar.systemInstructions')"
+                    >
+                      <div class="bg-code-bg p-2">
+                        <LLMContentRenderer
+                          :content="
+                            JSON.stringify([{ role: 'system', content: parsedSystemInstructions }])
+                          "
+                          :observation-type="span.gen_ai_operation_name"
+                          content-type="input"
+                          view-mode="formatted"
+                        />
+                      </div>
+                    </OCollapsible>
+                  </div>
+                  <div
+                    v-if="!hasContent(previewInput) && !parsedSystemInstructions"
+                    class="text-text-secondary p-8 text-center text-sm italic"
+                  >
+                    {{ t("traces.traceDetailsSidebar.noDataAvailable") }}
+                  </div>
+                  <LLMContentRenderer
+                    v-if="hasContent(previewInput)"
+                    :content="previewInput"
+                    :observation-type="previewOperationName"
+                    content-type="input"
+                    :span="span"
+                    view-mode="formatted"
+                    :instance-id="`${span.span_id}-input`"
+                  />
+                </div>
+              </div>
+
+              <!-- Output Section -->
+              <div
+                class="io-section flex h-full w-1/2 shrink-0 grow-0 basis-[calc(50%-0.4rem)] flex-col"
+              >
+                <div
+                  class="section-label text-text-heading mb-2 flex items-center justify-between text-sm font-bold"
+                  :class="isFullscreen ? 'bg-surface-panel' : ''"
+                >
+                  <div>{{ t("traces.traceDetailsSidebar.output") }}</div>
+                  <div class="flex items-center gap-1">
+                    <OButton
+                      variant="outline"
+                      size="icon"
+                      :title="
+                        isFullscreen
+                          ? t('traces.traceDetailsSidebar.exitFullscreen')
+                          : t('traces.traceDetailsSidebar.enterFullscreen')
+                      "
+                      @click="toggleFullscreen"
+                    >
+                      <OIcon :name="isFullscreen ? 'fullscreen-exit' : 'fullscreen'" size="xs" />
+                    </OButton>
+                    <OButton
+                      variant="outline"
+                      size="icon"
+                      :title="t('traces.traceDetailsSidebar.copyOutput')"
+                      @click="copyContent(previewOutput, 'output')"
+                      :disabled="!hasContent(previewOutput)"
+                    >
+                      <OIcon name="content-copy" size="xs" />
+                    </OButton>
+                  </div>
+                </div>
+                <div
+                  class="llm-content-box border-card-glass-border rounded-default bg-code-bg h-full max-h-[calc(100%-1.625rem)] flex-1 overflow-x-hidden overflow-y-auto border border-solid p-3"
+                >
+                  <div
+                    v-if="!hasContent(previewOutput)"
+                    class="text-text-secondary p-8 text-center text-sm italic"
+                  >
+                    {{ t("traces.traceDetailsSidebar.noDataAvailable") }}
+                  </div>
+                  <LLMContentRenderer
+                    v-else
+                    :content="previewOutput"
+                    :observation-type="previewOperationName"
+                    content-type="output"
+                    :span="span"
+                    view-mode="formatted"
+                    :instance-id="`${span.span_id}-output`"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <!-- Model Parameters (collapsible) -->
+            <OCollapsible
+              v-if="span.llm_request_parameters"
+              v-model="modelParamsOpen"
+              :label="t('traces.traceDetailsSidebar.modelParameters')"
+              class="mt-3"
+            >
+              <pre class="bg-code-bg rounded-default m-0 overflow-x-auto p-4 font-mono text-xs">{{
+                formatModelParams(span.llm_request_parameters)
+              }}</pre>
+            </OCollapsible>
+          </div>
+        </OTabPanel>
+
+        <OTabPanel name="attributes" class="flex flex-col overflow-hidden p-0">
+          <!-- View mode toggle toolbar -->
+          <div class="flex h-fit! items-center justify-start pb-1.5!">
+            <OToggleGroup v-model="attributesViewMode" class="rounded-default!">
+              <OToggleGroupItem value="json" size="xs" class="h-5! text-xs!">
+                <template #icon-left
+                  ><OIcon name="data-object" size="xs" class="shrink-0"
+                /></template>
+                {{ t("common.json") }}
+              </OToggleGroupItem>
+              <OToggleGroupItem value="table" size="xs" class="h-5! text-xs!">
+                <template #icon-left
+                  ><OIcon name="table-chart" size="xs" class="shrink-0"
+                /></template>
+                {{ t("traces.traceDetailsSidebar.table") }}
+              </OToggleGroupItem>
+            </OToggleGroup>
+          </div>
+          <!-- JSON View -->
+          <div v-if="attributesViewMode === 'json'" class="grow overflow-auto">
+            <JsonPreview
+              :value="attributesForDisplay"
+              :highlight-query="searchQuery"
+              data-test="trace-details-sidebar-attributes-table"
+            >
+              <template #field-dropdown="{ field, value: fieldValue }">
+                <ul class="m-0 flex list-none flex-col p-0">
+                  <li
+                    v-for="action in filterActions"
+                    :key="action.operator"
+                    :data-test="`trace-details-sidebar-json-filter-action-${action.operator}`"
+                    class="hover:bg-muted/50 flex cursor-pointer items-center gap-1 px-1 py-1"
+                    @click.stop="
+                      $emit('apply-filter-immediately', {
+                        field,
+                        value: getFilterValue(field, fieldValue),
+                        operator: action.operator,
+                      })
+                    "
+                  >
+                    <span class="me-1 inline-flex shrink-0">
+                      <OButton variant="ghost" size="icon-xs-circle">
+                        <OIcon color="currentColor" class="h-[0.7rem]! w-[0.7rem]! pb-[0.185rem]!">
+                          <component :is="action.iconComponent" />
+                        </OIcon>
+                      </OButton>
+                    </span>
+                    <span class="text-sm!">{{ $t("traces.applyAndSearch") }}</span>
+                  </li>
+                </ul>
+              </template>
+            </JsonPreview>
+          </div>
+          <!-- Table View -->
+          <!-- eslint-disable local/no-hardcoded-px -- mixed with vh/vw — vh tracks the window while rem tracks font-size; keep the expression unit-consistent -->
+          <div
+            v-else
+            class="tab-content-dynamic-height border-card-glass-border flex-1 overflow-hidden border-1 border-solid"
+            :class="
+              isLLMSpan && llmMetrics && span.gen_ai_response_model
+                ? '[height:calc(100vh-312px)]'
+                : '[height:calc(100vh-276px)]'
+            "
+            data-test="trace-details-sidebar-attributes-tenstack-table"
+          >
+            <!-- eslint-enable local/no-hardcoded-px -->
+            <OTable
+              :data="attributesTableRows"
+              :columns="attributesTableColumns"
+              :default-columns="false"
+              :row-height="28"
+              :show-global-filter="false"
+              pagination="none"
+            >
+              <template #cell-value="{ row }">
+                <AttributeValueCell :field="row.field" :value="row.value">
+                  <template #dropdown="{ field, value: fieldValue }">
+                    <ul class="m-0 flex list-none flex-col p-0">
+                      <li
+                        v-for="action in filterActions"
+                        :key="action.operator"
+                        :data-test="`trace-details-sidebar-attr-filter-action-${action.operator}`"
+                        class="hover:bg-muted/50 flex cursor-pointer items-center gap-1 px-1 py-1"
+                        @click.stop="
+                          $emit('apply-filter-immediately', {
+                            field,
+                            value: getFilterValue(field, fieldValue),
+                            operator: action.operator,
+                          })
+                        "
+                      >
+                        <span class="me-1 inline-flex shrink-0">
+                          <OButton variant="ghost" size="icon-xs-circle">
+                            <OIcon
+                              color="currentColor"
+                              class="h-[0.7rem]! w-[0.7rem]! pb-[0.185rem]!"
+                            >
+                              <component :is="action.iconComponent" />
+                            </OIcon>
+                          </OButton>
+                        </span>
+                        <span class="text-sm!">{{ $t("traces.applyAndSearch") }}</span>
+                      </li>
+                    </ul>
+                  </template>
+                </AttributeValueCell>
+              </template>
+            </OTable>
+          </div>
+        </OTabPanel>
+        <OTabPanel name="events" class="flex h-[30.6rem]! flex-col p-0">
+          <template v-if="spanDetails.events.length">
+            <!-- Mini-timeline: the same events as the table, plotted against
+                 this span's own duration so "when within the span" is a glance
+                 rather than a subtraction. -->
+            <div
+              class="shrink-0 ps-1 pe-1 pb-[0.325rem]"
+              data-test="trace-details-sidebar-events-timeline"
+            >
+              <div class="text-3xs text-text-muted flex items-center justify-between pb-1">
+                <span>{{ t("traces.spanEventTimeline") }}</span>
+                <span>{{ getDuration }}</span>
+              </div>
+              <div
+                ref="eventTimelineRef"
+                class="bg-surface-panel border-card-glass-border rounded-default relative h-5 w-full border border-solid"
+              >
+                <button
+                  v-for="cluster in spanEventClusters"
+                  :key="cluster.key"
+                  type="button"
+                  class="absolute top-1/2 h-3 w-0.75 -translate-x-1/2 -translate-y-1/2 cursor-pointer p-0 before:absolute before:top-1/2 before:left-1/2 before:h-5 before:w-2.5 before:-translate-x-1/2 before:-translate-y-1/2 before:content-['']"
+                  :class="SEVERITY_MARKER_CLASS[cluster.severity]"
+                  :style="{ left: cluster.left + '%' }"
+                  :title="clusterLabel(cluster)"
+                  :aria-label="clusterAriaLabel(cluster)"
+                  :data-event-severity="cluster.severity"
+                  :data-event-count="cluster.events.length"
+                  data-test="span-event-timeline-marker"
+                  @click="onEventMarkerClick(cluster.events[0])"
+                />
+              </div>
+            </div>
+            <!-- Wrap toggle toolbar -->
+            <div class="flex items-center gap-1 ps-1 pb-[0.325rem]">
+              <OSwitch v-model="eventsWrap" :label="t('common.wrap')" size="md" class="gap-1!" />
+            </div>
+            <!-- TenstackTable for events -->
+            <!-- eslint-disable local/no-hardcoded-px -- mixed with vh/vw — vh tracks the window while rem tracks font-size; keep the expression unit-consistent -->
+            <div
+              class="traces-events-table-container tab-content-dynamic-height border-card-glass-border rounded-default flex-1 overflow-hidden border-1 border-solid"
+              :class="
+                isLLMSpan && llmMetrics && span.gen_ai_response_model
+                  ? '[height:calc(100vh-312px)]'
+                  : '[height:calc(100vh-276px)]'
+              "
+              data-test="trace-details-sidebar-events-table"
+            >
+              <!-- eslint-enable local/no-hardcoded-px -->
+              <OTable
+                ref="eventsTableRef"
+                :data="eventsRowsWithKey"
+                :columns="eventsTableColumns"
+                row-key="__rowId"
+                :wrap="eventsWrap"
+                :default-columns="false"
+                :row-height="28"
+                :show-global-filter="false"
+                pagination="none"
+                expansion="multiple"
+                :enable-column-reorder="true"
+                :enable-column-resize="true"
+                persist-columns
+                table-id="trace-details-events"
+                :expanded-ids="expandedEventIds"
+                @update:expanded-ids="expandedEventIds = $event"
+              >
+                <template #expansion="{ row }">
+                  <JsonPreview
+                    :value="row"
+                    class="py-1.5 ps-1.5"
+                    copyButtonClass="left-1! w-fit! sticky!"
+                    mode="expanded"
+                    @copy="copyContentToClipboard"
+                  />
+                </template>
+              </OTable>
+            </div>
+          </template>
+          <OEmptyState
+            v-else
+            size="inline"
+            variant="no-results"
+            :title="t('traces.noEventsPresent')"
+            hide-action
+            data-test="trace-details-sidebar-no-events"
+          />
+        </OTabPanel>
+        <OTabPanel name="error" class="h-full">
+          <TraceErrorTab
+            :span="span"
+            :search-query="searchQuery"
+            :show-llm-metrics="!!(isLLMSpan && llmMetrics && span.gen_ai_response_model)"
+            data-test="trace-details-sidebar-no-exceptions"
+          />
+        </OTabPanel>
+
+        <OTabPanel name="database" class="h-full p-0">
+          <DbSpanDetails :span="span" :stream="streamName" />
+        </OTabPanel>
+
+        <OTabPanel name="links">
+          <div v-if="spanLinks.length" class="max-h-80 overflow-auto">
+            <table
+              class="trace-detail-tab-table border-card-glass-border w-full border border-solid"
+              data-test="trace-details-sidebar-links-table"
+            >
+              <thead class="thead-sticky bg-surface-accent text-left">
+                <tr>
+                  <th
+                    v-for="(col, index) in linkColumns"
+                    :key="'result_' + index"
+                    :data-test="`trace-events-table-th-${col.label}`"
+                    class="bg-border-default"
+                  >
+                    {{ col.label }}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="(row, index) in spanLinks"
+                  :data-test="`trace-event-detail-link-${index}`"
+                  :key="'expand_' + index"
+                  tabindex="0"
+                  @click="openReferenceTrace('span', row)"
+                  @keydown="onLinkRowKeydown($event, row)"
+                  class="pointer focus-visible:bg-surface-accent cursor-pointer focus-visible:outline-none"
+                >
+                  <td
+                    v-for="column in linkColumns"
+                    :key="index + '-' + column.name"
+                    class="relative mb-0.5 cursor-pointer overflow-visible p-0"
+                  >
+                    <div class="flex flex-nowrap items-center">
+                      {{ column.prop(row) }}
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <OEmptyState
+            v-else
+            size="inline"
+            variant="no-results"
+            :title="t('traces.noLinksPresent')"
+            hide-action
+            data-test="trace-details-sidebar-no-links"
+          />
+        </OTabPanel>
+
+        <!-- Correlated Logs Tab Panel -->
+        <OTabPanel
+          name="correlated-logs"
+          class="traces-correlated-logs-container h-full max-h-full overflow-hidden p-0"
+        >
+          <CorrelatedLogsTable
+            v-if="correlationProps"
+            :service-name="correlationProps.serviceName"
+            :matched-dimensions="correlationProps.matchedDimensions"
+            :additional-dimensions="correlationProps.additionalDimensions"
+            :matched-set-id="correlationProps.matchedSetId"
+            :chip-dimensions="correlationProps.chipDimensions"
+            :source-event="correlationProps.sourceEvent"
+            :log-streams="correlationProps.logStreams"
+            :source-stream="correlationProps.sourceStream"
+            :source-type="correlationProps.sourceType"
+            :available-dimensions="correlationProps.availableDimensions"
+            :semantic-groups="correlationProps.semanticGroups"
+            :fts-fields="correlationProps.ftsFields"
+            :time-range="correlationProps.timeRange"
+            :hide-view-related-button="true"
+            :hide-search-term-actions="false"
+            :hide-dimension-filters="true"
+            :hide-reset-filters-button="true"
+          />
+          <!-- Loading/Empty state when no data -->
+          <div v-else class="flex h-full items-center justify-center py-20">
+            <div class="text-center">
+              <OSpinner v-if="correlationLoading" size="lg" class="mb-4" />
+              <div v-else-if="correlationError" class="text-sm font-bold">
+                {{ correlationError }}
+              </div>
+              <div v-else class="text-text-muted text-base">
+                {{ t("correlation.clickToLoadLogs") }}
+              </div>
+            </div>
+          </div>
+        </OTabPanel>
+
+        <!-- Correlated Metrics Tab Panel -->
+        <OTabPanel
+          name="correlated-metrics"
+          class="traces-correlated-metrics-container h-full max-h-full overflow-hidden p-0"
+        >
+          <TelemetryCorrelationDashboard
+            v-if="correlationProps"
+            mode="embedded-tabs"
+            external-active-tab="metrics"
+            :service-name="correlationProps.serviceName"
+            :matched-dimensions="correlationProps.matchedDimensions"
+            :additional-dimensions="correlationProps.additionalDimensions"
+            :matched-set-id="correlationProps.matchedSetId"
+            :chip-dimensions="correlationProps.chipDimensions"
+            :source-event="correlationProps.sourceEvent"
+            :metric-streams="correlationProps.metricStreams"
+            :log-streams="correlationProps.logStreams"
+            :trace-streams="correlationProps.traceStreams"
+            :source-stream="correlationProps.sourceStream"
+            :source-type="correlationProps.sourceType"
+            :available-dimensions="correlationProps.availableDimensions"
+            :fts-fields="correlationProps.ftsFields"
+            :time-range="correlationProps.timeRange"
+            :hide-dimension-filters="true"
+            :metric-group-definitions="metricGroupResources"
+            :panelHeight="12"
+            :panelWidth="96"
+            @close="$emit('update:activeTab', 'attributes')"
+          />
+          <!-- Loading/Empty state when no data -->
+          <div v-else class="flex h-full items-center justify-center py-20">
+            <div class="text-center">
+              <OSpinner v-if="correlationLoading" size="lg" class="mb-4" />
+              <div v-else-if="correlationError" class="text-sm font-bold">
+                {{ correlationError }}
+              </div>
+              <div v-else class="text-text-muted text-base">
+                {{ t("correlation.clickToLoadMetrics") }}
+              </div>
+            </div>
+          </div>
+        </OTabPanel>
+      </OTabPanels>
+    </div>
+  </div>
+</template>
+
+<script lang="ts">
+import OTabs from "@/lib/navigation/Tabs/OTabs.vue";
+import OTab from "@/lib/navigation/Tabs/OTab.vue";
+import OTabPanels from "@/lib/navigation/Tabs/OTabPanels.vue";
+import OTabPanel from "@/lib/navigation/Tabs/OTabPanel.vue";
+import OToggleGroup from "@/lib/core/ToggleGroup/OToggleGroup.vue";
+import OToggleGroupItem from "@/lib/core/ToggleGroup/OToggleGroupItem.vue";
+import OButton from "@/lib/core/Button/OButton.vue";
+import OIcon from "@/lib/core/Icon/OIcon.vue";
+import OTooltip from "@/lib/overlay/Tooltip/OTooltip.vue";
+import OCollapsible from "@/lib/core/Collapsible/OCollapsible.vue";
+import OEmptyState from "@/lib/core/EmptyState/OEmptyState.vue";
+import { cloneDeep } from "lodash-es";
+import { timestampToTimezoneDate } from "@/utils/timezone";
+import {
+  useSpanEventMarkers,
+  clusterSpanEventMarkers,
+  truncateEventName,
+  SEVERITY_MARKER_CLASS,
+  type SpanEventMarker,
+  type SpanEventCluster,
+} from "@/composables/traces/useSpanEvents";
+import { copyToClipboard } from "@/utils/clipboard";
+import { toggleFullscreen as domToggleFullScreen } from "@/utils/dom";
+import { defineComponent, onBeforeMount, ref, watch, type Ref, type PropType, inject } from "vue";
+import { useStore } from "vuex";
+import useTheme from "@/composables/useTheme";
+import { raw, useI18nTyped } from "@/types/i18n";
+import { computed } from "vue";
+import { formatTimeWithSuffix, convertTimeFromNsToUs, getImageURL } from "@/utils/zincutils";
+import useTraces from "@/composables/useTraces";
+import { useRouter } from "vue-router";
+import { onMounted, onUnmounted, defineAsyncComponent, nextTick } from "vue";
+import LogsHighLighting from "@/components/logs/LogsHighLighting.vue";
+import JsonPreview from "@/components/JsonPreview.vue";
+import CorrelatedLogsTable from "@/plugins/correlation/CorrelatedLogsTable.vue";
+import { useServiceCorrelation } from "@/composables/useServiceCorrelation";
+import { buildChipDimensionsFromFilters } from "@/services/service_streams";
+import { buildWorkloadChipDimensions } from "@/composables/useMetricSubjectButtons";
+import { normalizeSeverity } from "@/utils/sourceEventSeverity";
+import type { TelemetryContext } from "@/utils/telemetryCorrelation";
+import config from "@/aws-exports";
+import { SPAN_KIND_MAP } from "@/utils/traces/constants";
+import {
+  type MetricGroupDefinition,
+  K8S_METRIC_GROUP_DEFINITIONS,
+} from "@/utils/metrics/metricGrouping";
+import DeployedCode from "@/components/icons/DeployedCode.vue";
+import { getServiceIconDataUrl } from "@/utils/traces/convertTraceData";
+import LLMContentRenderer from "@/plugins/traces/LLMContentRenderer.vue";
+import { extractGenAiPartText } from "@/plugins/traces/genAiParts";
+import OTable from "@/lib/core/Table/OTable.vue";
+import {
+  hasTracePreview,
+  isLLMTrace,
+  parseUsageDetails,
+  parseCostDetails,
+  getObservationTypeColor,
+  formatModelParameters,
+} from "@/utils/llmUtils";
+import { escapeHtml } from "@/utils/html";
+import EqualIcon from "@/components/icons/EqualIcon.vue";
+import NotEqualIcon from "@/components/icons/NotEqualIcon.vue";
+import AttributeValueCell from "@/components/AttributeValueCell.vue";
+import useTraceDetails from "@/composables/traces/useTraceDetails";
+import DbSpanDetails from "./DbSpanDetails.vue";
+import TraceErrorTab from "./components/TraceErrorTab.vue";
+import OSpinner from "@/lib/feedback/Spinner/OSpinner.vue";
+import OSwitch from "@/lib/forms/Switch/OSwitch.vue";
+import OTag from "@/lib/core/Badge/OTag.vue";
+import OSeparator from "@/lib/core/Separator/OSeparator.vue";
+import { toast } from "@/lib/feedback/Toast/useToast";
+import {
+  TRACE_SERVICE_DETECTION_KEY,
+  useSpanServiceDetection,
+} from "@/utils/traces/useSpanServiceDetection";
+import type { Span } from "@/ts/interfaces/traces/span.types";
+import { getOrSetServiceColor } from "@/utils/traces/serviceColorRegistry";
+
+// luxon equivalent of "MMM DD, YYYY HH:mm:ss.SSS Z" → e.g. "Jun 24, 2026 17:39:32.157 +0530"
+const HUMAN_TZ_FORMAT = "MMM dd, yyyy HH:mm:ss.SSS ZZZ";
+
+export default defineComponent({
+  name: "TraceDetailsSidebar",
+  props: {
+    span: {
+      type: Object as PropType<Span>,
+      default: () => null,
+    },
+    baseTracePosition: {
+      type: Object,
+      default: () => null,
+    },
+    searchQuery: {
+      type: String,
+      default: "",
+    },
+    streamName: {
+      type: String,
+      default: "",
+    },
+    serviceStreamsEnabled: {
+      type: Boolean,
+      default: false,
+    },
+    parentMode: {
+      type: String,
+      default: "standalone",
+    },
+    /**
+     * Index of the span event to focus, set when a waterfall or flame-graph
+     * marker is clicked. Selecting a span hides the timeline those markers live
+     * on, so the click lands here instead.
+     */
+    focusEventIndex: {
+      type: Number as PropType<number | null>,
+      default: null,
+    },
+    activeTab: {
+      type: String,
+      default: "attributes",
+    },
+    selectedLogStreams: {
+      type: Array,
+      default: () => [],
+    },
+    showLogStreamSelector: {
+      type: Boolean,
+      default: false,
+    },
+    showEvaluateButton: {
+      type: Boolean,
+      default: false,
+    },
+    showAnnotateButtons: {
+      type: Boolean,
+      default: false,
+    },
+  },
+  components: {
+    OSeparator,
+    OTabs,
+    OTab,
+    OTabPanels,
+    OTabPanel,
+    OToggleGroup,
+    OToggleGroupItem,
+    OButton,
+    OIcon,
+    OTooltip,
+    OCollapsible,
+    OEmptyState,
+    LogsHighLighting,
+    JsonPreview,
+    LLMContentRenderer,
+    OTable,
+    CorrelatedLogsTable,
+    TelemetryCorrelationDashboard: defineAsyncComponent(
+      () => import("@/plugins/correlation/TelemetryCorrelationDashboard.vue"),
+    ),
+    TraceAnnotateMenu: defineAsyncComponent(
+      () => import("@/enterprise/components/AIObservability/TraceAnnotateMenu.vue"),
+    ),
+    EqualIcon,
+    NotEqualIcon,
+    AttributeValueCell,
+    DeployedCode,
+    DbSpanDetails,
+    TraceErrorTab,
+    OSpinner,
+    OSwitch,
+    OTag,
+  },
+  emits: [
+    "close",
+    "view-logs",
+    "select-span",
+    "open-trace",
+    "show-correlation",
+    "add-filter",
+    "apply-filter-immediately",
+    "add-field-to-table",
+    "evaluate",
+    "add-to-dataset",
+    "update:activeTab",
+  ],
+  setup(props, { emit }) {
+    const serviceDetectionConfig = inject(TRACE_SERVICE_DETECTION_KEY, ref(null));
+    const { resolveSpanIdentity } = useSpanServiceDetection(serviceDetectionConfig);
+    const { t } = useI18nTyped();
+    // Check if this is an LLM span to set default tab
+    const isLLMSpan = computed(() => isLLMTrace(props.span));
+    const canPreviewSpan = computed(() => hasTracePreview(props.span));
+    const previewInput = computed(
+      () => props.span?.gen_ai_input_messages ?? props.span?.attributes_prompt ?? "",
+    );
+    const previewOutput = computed(
+      () => props.span?.gen_ai_output_messages ?? props.span?.attributes_response ?? "",
+    );
+    const previewOperationName = computed(() => props.span?.gen_ai_operation_name ?? "evaluator");
+
+    const spanDetails: any = ref({
+      attrs: {},
+      events: [],
+    });
+
+    const { hasSpanError, hasExceptionEvents } = useTraceDetails(
+      computed(() => props.span),
+      t,
+    );
+
+    const spanHttpResendCount = computed(() => {
+      const attrs = props.span;
+      if (!attrs) return null;
+      const count = attrs["http_request_resend_count"] ?? null;
+      if (count === null || count === undefined) return null;
+      const num = parseInt(String(count), 10);
+      return !isNaN(num) && num > 0 ? num : null;
+    });
+
+    const activeTabModel = computed({
+      get: () => props.activeTab,
+      set: (value: string) => emit("update:activeTab", value),
+    });
+
+    const navigateToError = () => {
+      activeTabModel.value = "error";
+    };
+    const tags: Ref<{ [key: string]: string }> = ref({});
+
+    // Ref for fullscreen container (parent container with both Input and Output)
+    const ioContainerRef = ref<HTMLElement | null>(null);
+
+    // Track fullscreen state
+    const isFullscreen = ref(false);
+    const sysInstrOpen = ref(false);
+    const modelParamsOpen = ref(false);
+
+    const closeSidebar = () => {
+      emit("close");
+    };
+
+    const pagination: any = ref({
+      rowsPerPage: 0,
+    });
+    const { buildQueryDetails, navigateToLogs, navigateToCorrelatedLogs, searchObj } = useTraces();
+    const router = useRouter();
+
+    const highlightTextMatch = (text: string, query: string): string => {
+      if (!query) return escapeHtml(text);
+      try {
+        // Escape special regex characters
+        const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const regex = new RegExp(`(${escapedQuery})`, "gi");
+        return escapeHtml(text).replace(
+          regex,
+          (match) => `<span class="trace-sidebar-highlight">${match}</span>`,
+        );
+      } catch (e) {
+        return escapeHtml(text);
+      }
+    };
+
+    // Emits class names only — the colours live in the style block below, driven
+    // by the registered --color-json-* tokens, so the output themes itself.
+    const highlightedJSON = (value: Record<string, unknown>) => {
+      const attrs = value;
+      const query = props.searchQuery;
+
+      const formatValue = (value: any): string => {
+        if (value === null) {
+          return `<span class="trace-json-null">${highlightTextMatch("null", query)}</span>`;
+        } else if (typeof value === "boolean") {
+          return `<span class="trace-json-boolean">${highlightTextMatch(String(value), query)}</span>`;
+        } else if (typeof value === "number") {
+          return `<span class="trace-json-number">${highlightTextMatch(String(value), query)}</span>`;
+        } else if (typeof value === "string") {
+          return `<span class="trace-json-string">"${highlightTextMatch(value, query)}"</span>`;
+        } else if (typeof value === "object") {
+          return `<span class="trace-json-object">"${highlightTextMatch(JSON.stringify(value), query)}"</span>`;
+        }
+        return highlightTextMatch(String(value), query);
+      };
+
+      const lines: string[] = [];
+      lines.push('<span class="trace-json-punct">{</span>');
+
+      const entries = Object.entries(attrs);
+      entries.forEach(([key, value], index) => {
+        const keyHtml = `<span class="trace-json-key">"${escapeHtml(key)}"</span>`;
+        const valueHtml = formatValue(value);
+        const comma = index < entries.length - 1 ? '<span class="trace-json-punct">,</span>' : "";
+        lines.push(`  ${keyHtml}<span class="trace-json-punct">:</span> ${valueHtml}${comma}`);
+      });
+
+      lines.push('<span class="trace-json-punct">}</span>');
+      return lines.join("\n");
+    };
+
+    const store = useStore();
+
+    const hasDbSpan = computed(() =>
+      Object.keys(props.span ?? {}).some((key) => key.startsWith("db_")),
+    );
+
+    const filterActions = [
+      { operator: "=" as const, iconComponent: EqualIcon },
+      { operator: "!=" as const, iconComponent: NotEqualIcon },
+    ];
+
+    const getFilterValue = (field: string, displayValue: unknown): unknown => {
+      const span = props.span as Record<string, unknown>;
+      if (field === "start_time") {
+        return span._start_time_ns ?? span.start_time ?? displayValue;
+      }
+      if (field === "end_time") {
+        return span._end_time_ns ?? span.end_time ?? displayValue;
+      }
+      const timestampField = store.state?.zoConfig?.timestamp_column || "_timestamp";
+      if (field === timestampField) {
+        return span[timestampField] ?? displayValue;
+      }
+
+      return displayValue;
+    };
+
+    const attributesForDisplay = computed(() => {
+      const attrs = { ...spanDetails.value.attrs };
+      delete attrs.gen_ai_input_messages;
+      delete attrs.gen_ai_output_messages;
+      delete attrs.gen_ai_system_instructions;
+      return attrs;
+    });
+
+    const attributesViewMode = ref<"json" | "table">("json");
+
+    const attributesTableColumns = [
+      {
+        accessorKey: "field",
+        id: "field",
+        header: t("traces.traceDetailsSidebar.field"),
+        size: 200,
+        meta: {
+          headerClass: "border-b border-e border-b-card-glass-border",
+          cellClass: "border-e border-b-card-glass-border text-json-key",
+        },
+      },
+      {
+        accessorKey: "value",
+        id: "value",
+        header: t("traces.traceDetailsSidebar.value"),
+        size: 400,
+        meta: {
+          headerClass: "border-b border-b-card-glass-border",
+          cellClass: "border-b-card-glass-border p-0!",
+        },
+      },
+    ];
+
+    const attributesTableRows = computed(() =>
+      Object.entries(attributesForDisplay.value).map(([key, value]) => ({
+        field: key,
+        value: typeof value === "string" ? value : JSON.stringify(value),
+      })),
+    );
+
+    watch(
+      [() => props.span, () => store.state.timezone],
+      () => {
+        tags.value = {};
+        spanDetails.value = getFormattedSpanDetails();
+      },
+      {
+        deep: true,
+      },
+    );
+
+    const tagColumns = [
+      {
+        name: "field",
+        label: t("traces.traceDetailsSidebar.field"),
+        field: "field",
+        align: "left" as const,
+        headerClasses: "text-left!",
+      },
+      {
+        name: "value",
+        label: t("traces.traceDetailsSidebar.value"),
+        field: "value",
+        align: "left" as const,
+        headerClasses: "text-left!",
+      },
+    ];
+
+    const getTagRows = computed(() => {
+      return Object.entries(tags.value).map(([key, value]) => ({
+        field: key,
+        value: typeof value === "string" ? value : JSON.stringify(value),
+      }));
+    });
+
+    const getDuration = computed(() => formatTimeWithSuffix(props.span.duration));
+
+    const getTTFT = computed(() => {
+      // Only calculate for LLM spans with completion_start_time
+      if (!props.span.gen_ai_completion_start_time || !props.span.start_time) {
+        return null;
+      }
+      // completion_start_time is in microseconds
+      // start_time is in nanoseconds, convert to microseconds
+      const completionStartTime = props.span.gen_ai_completion_start_time;
+      const spanStartTimeUs = props.span.start_time / 1000;
+      const ttftUs = completionStartTime - spanStartTimeUs;
+      return formatTimeWithSuffix(ttftUs);
+    });
+
+    onBeforeMount(() => {
+      spanDetails.value = getFormattedSpanDetails();
+    });
+
+    // Get current theme via the sanctioned dark-mode seam
+    const { isDark: isDarkMode } = useTheme();
+
+    // Check if View Logs button should be disabled
+    const isViewLogsDisabled = computed(() => {
+      // Enterprise loading state
+      if (config.isEnterprise === "true" && correlationLoading.value) {
+        return true;
+      }
+
+      // Non-enterprise mode with visible log stream selector, disable when no streams are selected
+      return (
+        config.isEnterprise !== "true" &&
+        props.showLogStreamSelector &&
+        props.selectedLogStreams.length === 0
+      );
+    });
+
+    // Get tooltip content based on disabled state
+    const viewLogsTooltipContent = computed(() => {
+      // Enterprise loading state
+      if (config.isEnterprise === "true" && correlationLoading.value) {
+        return t("correlation.loadingCorrelation");
+      }
+
+      // Non-enterprise mode with no log streams selected
+      if (
+        config.isEnterprise !== "true" &&
+        props.showLogStreamSelector &&
+        props.selectedLogStreams.length === 0
+      ) {
+        return t("search.selectLogsStreamFirst");
+      }
+
+      // Default enabled state
+      return t("traces.viewLogs");
+    });
+
+    const eventColumns = ref([
+      {
+        name: "@timestamp",
+        field: "@timestamp",
+        prop: (row: any) =>
+          timestampToTimezoneDate(
+            row[store.state.zoConfig.timestamp_column] / 1000000,
+            store.state.timezone,
+            HUMAN_TZ_FORMAT,
+          ),
+        label: t("traces.traceDetailsSidebar.timestamp"),
+        align: "left" as const,
+        sortable: true,
+      },
+      {
+        name: "source",
+        field: "source",
+        prop: (row: any) => JSON.stringify(row),
+        label: "source",
+        align: "left" as const,
+        sortable: true,
+      },
+    ]);
+
+    const eventsWrap = ref(false);
+
+    const eventsTableRef = ref<any>(null);
+
+    /**
+     * Row keys expanded in the events table.
+     *
+     * OTable drives expansion from this prop through `useTableExpansion`, which
+     * keeps its own Set — it does not read TanStack's expansion state, so
+     * `row.toggleExpanded()` on the table instance has no visible effect. Rows
+     * are keyed by `__rowId` (the array index, see `eventsRowsWithKey`), and a
+     * normalized event keeps that index, so a marker maps straight onto its row.
+     */
+    const expandedEventIds = ref<string[]>([]);
+
+    // Mini-timeline window is this span, not the trace: start_time is
+    // nanoseconds (see getTTFT above) and duration is already microseconds.
+    const spanEventMarkers = useSpanEventMarkers(
+      () => props.span?.events,
+      () => ({
+        startUs: Number(props.span?.start_time) / 1000,
+        durationUs: Number(props.span?.duration),
+      }),
+      () => store.state.zoConfig?.timestamp_column,
+    );
+
+    const eventMarkerLabel = (marker: SpanEventMarker) =>
+      marker.severity === "error"
+        ? t("traces.exceptionMarkerTooltip", { type: truncateEventName(marker.exceptionType) })
+        : t("traces.eventMarkerTooltip", {
+            name: truncateEventName(marker.name) || t("traces.spanEventFallback"),
+          });
+
+    // The mini-timeline resizes with the sidebar, so the cluster bucket is
+    // derived from the track's measured width rather than a fixed percentage.
+    const eventTimelineRef = ref<HTMLElement | null>(null);
+    const eventTimelineWidth = ref(0);
+
+    const onEventTimelineResize = () => {
+      eventTimelineWidth.value = eventTimelineRef.value?.clientWidth ?? 0;
+    };
+
+    /**
+     * The track is not in the DOM at mount: it lives inside the Events tab
+     * panel, which renders `v-if="isActive"` with no keep-alive, and is further
+     * gated on the span having events. Observing in `onMounted` therefore found
+     * nothing and never retried, leaving the width at 0 — where the cluster
+     * threshold is 0 and every event renders as its own overlapping marker.
+     * Watching the template ref attaches whenever the track appears and
+     * re-attaches after the user leaves the tab and comes back.
+     */
+    watch(
+      eventTimelineRef,
+      (element, _previous, onCleanup) => {
+        if (!element || typeof ResizeObserver === "undefined") return;
+
+        onEventTimelineResize();
+
+        const observer = new ResizeObserver(onEventTimelineResize);
+        observer.observe(element);
+        onCleanup(() => observer.disconnect());
+      },
+      { flush: "post" },
+    );
+
+    const spanEventClusters = computed(() =>
+      clusterSpanEventMarkers(spanEventMarkers.value, eventTimelineWidth.value),
+    );
+
+    const clusterLabel = (cluster: SpanEventCluster) =>
+      cluster.events.length > 1
+        ? t("traces.eventClusterTooltip", { count: cluster.events.length })
+        : eventMarkerLabel(cluster.events[0]);
+
+    const clusterAriaLabel = (cluster: SpanEventCluster) => {
+      if (cluster.events.length === 1) return eventMarkerLabel(cluster.events[0]);
+      const errors = cluster.events.filter((event) => event.severity === "error").length;
+      const count = cluster.events.length;
+      return errors === 1
+        ? t("traces.eventClusterAriaLabel", { count, errors })
+        : t("traces.eventClusterAriaLabelPlural", { count, errors });
+    };
+
+    // Rows are keyed by array index (see `eventsRowsWithKey`), and normalized
+    // events keep that index, so a marker maps straight onto its table row.
+    const focusEvent = (index: number) => {
+      expandedEventIds.value = [String(index)];
+    };
+
+    const onEventMarkerClick = (marker: SpanEventMarker) => {
+      focusEvent(marker.index);
+    };
+
+    // The expansion names a row of *this* span's events table. Carrying it to
+    // the next span expands an unrelated row that happens to share the index.
+    // `focusEventIndex` arrives a tick later (see TraceDetails.onSelectSpanEvent),
+    // so a marker-driven span change still lands on its event.
+    watch(
+      () => props.span?.span_id,
+      () => {
+        expandedEventIds.value = [];
+      },
+    );
+
+    watch(
+      () => props.focusEventIndex,
+      (index) => {
+        if (index === null || index === undefined) return;
+        focusEvent(index);
+      },
+    );
+
+    // Keyed by a non-enumerable `__rowId` (the array index): span events can
+    // share, or lack, `_timestamp`, so keying expansion on it would expand
+    // duplicates together. Non-enumerable keeps it out of the JSON preview.
+    const eventsRowsWithKey = computed(() =>
+      (spanDetails.value.events || []).map((e: any, i: number) =>
+        Object.defineProperty({ ...e }, "__rowId", {
+          value: i,
+          enumerable: false,
+        }),
+      ),
+    );
+
+    const eventsTableColumns = computed(() => {
+      const events = spanDetails.value.events;
+      if (!events || !events.length) return [];
+
+      const tsCol = store.state.zoConfig.timestamp_column;
+      const allKeys = new Set<string>();
+      events.forEach((event: any) => {
+        Object.keys(event).forEach((key) => allKeys.add(key));
+      });
+
+      const cols: any[] = [];
+
+      // Timestamp first
+      if (allKeys.has(tsCol)) {
+        cols.push({
+          accessorKey: tsCol,
+          id: tsCol,
+          header: t("traces.traceDetailsSidebar.timestamp"),
+          size: 220,
+          accessorFn: (row: any) =>
+            timestampToTimezoneDate(row[tsCol] / 1000000, store.state.timezone, HUMAN_TZ_FORMAT),
+          meta: {
+            headerClass: "border-b border-e border-b-card-glass-border",
+            cellClass: "border-e border-b-card-glass-border",
+          },
+        });
+        allKeys.delete(tsCol);
+      }
+
+      // All remaining keys
+      allKeys.forEach((key) => {
+        cols.push({
+          accessorKey: key,
+          id: key,
+          header: key,
+          size: 200,
+          accessorFn: (row: any) => {
+            const val = row[key];
+            if (val === null || val === undefined) return "";
+            if (val === "string") {
+              try {
+                return JSON.parse(val);
+              } catch (err) {
+                return String(val);
+              }
+            }
+            return typeof val === "object" ? JSON.stringify(val) : String(val);
+          },
+          meta: {
+            headerClass: "border-b border-e border-b-card-glass-border",
+            cellClass: "border-e border-b-card-glass-border",
+          },
+        });
+      });
+
+      // Reorder is owned by the table's own columnOrder state; re-applying it to
+      // the columns prop here would fight it.
+      return cols;
+    });
+
+    const linkColumns = ref([
+      {
+        name: "traceId",
+        prop: (row: any) => (row.context ? row?.context?.traceId : ""),
+        label: raw("TraceId"),
+        align: "left",
+        sortable: true,
+      },
+      {
+        name: "spanId",
+        prop: (row: any) => (row.context ? row?.context?.spanId : ""),
+        label: raw("spanId"),
+        align: "left",
+        sortable: true,
+      },
+    ]);
+
+    const getSpanKind = (id: number | string | null | undefined): string => {
+      if (id === null || id === undefined || id === "") return "Unspecified";
+      return SPAN_KIND_MAP[String(id)] || String(id);
+    };
+
+    const getFormattedSpanDetails = () => {
+      const spanDetails: { attrs: any; events: any[] } = {
+        attrs: {},
+        events: [],
+      };
+
+      spanDetails.attrs = cloneDeep(props.span);
+
+      if (spanDetails.attrs.events) delete spanDetails.attrs.events;
+
+      // These are custom meta fields for start_time and end_time so removing it from spanDetails
+      delete spanDetails.attrs._start_time_ns;
+      delete spanDetails.attrs._end_time_ns;
+
+      spanDetails.attrs.duration = spanDetails.attrs.duration + "us";
+      spanDetails.attrs[store.state.zoConfig.timestamp_column] = timestampToTimezoneDate(
+        spanDetails.attrs[store.state.zoConfig.timestamp_column] / 1000,
+        store.state.timezone,
+        HUMAN_TZ_FORMAT,
+      );
+
+      spanDetails.attrs["start_time"] = timestampToTimezoneDate(
+        spanDetails.attrs["start_time"] / 1000000,
+        store.state.timezone,
+        HUMAN_TZ_FORMAT,
+      );
+
+      spanDetails.attrs["end_time"] = timestampToTimezoneDate(
+        spanDetails.attrs["end_time"] / 1000000,
+        store.state.timezone,
+        HUMAN_TZ_FORMAT,
+      );
+
+      spanDetails.attrs.span_kind = getSpanKind(spanDetails.attrs.span_kind);
+
+      try {
+        spanDetails.events = JSON.parse((props.span.events as unknown as string) || "[]").map(
+          (event: any) => event,
+        );
+      } catch (_e: any) {
+        console.log(_e);
+        spanDetails.events = [];
+      }
+
+      return spanDetails;
+    };
+
+    const span_details = new Set([
+      "span_id",
+      "trace_id",
+      "operation_name",
+      store.state.zoConfig.timestamp_column,
+      "start_time",
+      "end_time",
+      "_start_time_ns",
+      "_end_time_ns",
+      "duration",
+      "busy_ns",
+      "idle_ns",
+      "events",
+    ]);
+
+    watch(
+      () => props.span,
+      () => {
+        tags.value = {};
+        Object.keys(props.span).forEach((key: string) => {
+          if (!span_details.has(key)) {
+            tags.value[key] = key === "span_kind" ? getSpanKind(props.span[key]) : props.span[key];
+          }
+        });
+      },
+      {
+        deep: true,
+        immediate: true,
+      },
+    );
+
+    const viewSpanLogs = async () => {
+      if (config.isEnterprise === "true") {
+        await loadCorrelation();
+        if (correlationProps.value?.logStreams?.length) {
+          navigateToCorrelatedLogs(correlationProps.value);
+        } else {
+          // Nothing correlated to this span — say so instead of navigating to an
+          // empty Logs page. A failed lookup reports its own reason; a successful
+          // lookup that found nothing gets the plain "no correlated logs" wording.
+          toast({
+            variant: "warning",
+            message:
+              correlationFailed.value && correlationError.value
+                ? raw(correlationError.value)
+                : t("traces.noCorrelatedLogsFound"),
+          });
+        }
+      } else {
+        const queryDetails = buildQueryDetails(props.span);
+        navigateToLogs(queryDetails);
+      }
+    };
+
+    const evaluateSpan = () => {
+      emit("evaluate", props.span);
+    };
+
+    /** The trace stream this span was read from — the annotation API needs it. */
+    const spanSourceStream = computed(() => String(props.span?._stream ?? props.streamName ?? ""));
+
+    /** Span start in MICROSECONDS (`start_time` is nanoseconds), widened by 1µs
+     *  so an inclusive lower-bound search can't exclude the span itself. A span
+     *  with no usable start falls back to the trace's own start: the APIs take
+     *  this as a POSITIVE lower bound, so 0 would be rejected. */
+    const spanStartTimeUs = computed(() => {
+      const startNs = Number(props.span?.start_time);
+      if (Number.isFinite(startNs)) return Math.max(1, Math.floor(startNs / 1_000) - 1);
+      return Number(props.baseTracePosition?.startTimeUs) || 1;
+    });
+
+    // The enterprise drawers live in the parent (same shape as evaluate), so the
+    // sidebar only reports which span was acted on.
+    const addSpanToDataset = () => {
+      emit("add-to-dataset", props.span);
+    };
+
+    // Gated on the raw fields rather than on a parsed hand-off: this runs on
+    // every render, and parsing a whole conversation to decide whether to draw
+    // a button is work the render loop should not be doing.
+    const canOpenPlayground = computed(
+      () =>
+        props.showAnnotateButtons &&
+        isLLMSpan.value &&
+        Boolean(
+          props.span?.gen_ai_input_messages ||
+          props.span?.gen_ai_output_messages ||
+          props.span?.gen_ai_system_instructions ||
+          props.span?.attributes_prompt ||
+          props.span?.attributes_response,
+        ),
+    );
+
+    /** The Playground is enterprise-only, so its module is pulled on click
+     *  rather than bundled into the traces chunk. */
+    const openInPlayground = async () => {
+      const [{ handoffFromSpan, stashHandoff }, { aiPlaygroundRoute }] = await Promise.all([
+        import("@/enterprise/views/AIObservability/playgroundHandoff"),
+        import("@/enterprise/views/AIObservability/playgroundRoutes"),
+      ]);
+      const handoff = handoffFromSpan(props.span);
+      // Navigating on a failed stash would land the user on an empty bench with
+      // no explanation, so the failure is reported where it happened.
+      if (!handoff || !stashHandoff(handoff)) {
+        toast({
+          variant: "error",
+          message: t("aiObservability.playground.openInPlaygroundFailed"),
+        });
+        return;
+      }
+      router.push(
+        aiPlaygroundRoute(store.state.selectedOrganization?.identifier ?? "", { fromSpan: true }),
+      );
+    };
+
+    const getStartTime = computed(() => {
+      return formatTimeWithSuffix(
+        convertTimeFromNsToUs(props.span.start_time) - (props.baseTracePosition?.startTimeUs || 0),
+      );
+    });
+
+    const copySpanId = () => {
+      copyToClipboard(props.span?.span_id || "", t, {
+        successMessage: t("traces.traceDetailsSidebar.spanIdCopied"),
+      });
+    };
+
+    const copyAttributesToClipboard = () => {
+      const attributes = props.span?.attributes || {};
+      const attributesText = JSON.stringify(attributes, null, 2);
+
+      copyToClipboard(attributesText, t, {
+        successMessage: t("traces.traceDetailsSidebar.attributesCopied"),
+      });
+    };
+
+    const openReferenceTrace = (type: string, link: any) => {
+      if (link && link.context) {
+        const query = {
+          stream: router.currentRoute.value.query.stream,
+          trace_id: link.context.traceId,
+          span_id: link.context.spanId,
+          from: convertTimeFromNsToUs(props.span.start_time) - 3600000000,
+          to: convertTimeFromNsToUs(props.span.end_time) + 3600000000,
+          org_identifier: store.state.selectedOrganization.identifier,
+        };
+
+        if (query.trace_id === props.span.trace_id) {
+          emit("select-span", link.context.spanId);
+          return;
+        }
+
+        router.push({
+          name: "traceDetails",
+          query,
+        });
+
+        emit("open-trace");
+      }
+    };
+
+    // Keyboard access for clickable span-link rows: Enter/Space activate, arrows move focus.
+    const onLinkRowKeydown = (event: KeyboardEvent, row: any) => {
+      if (event.target !== event.currentTarget) return;
+      const currentRow = event.currentTarget as HTMLElement;
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        openReferenceTrace("span", row);
+      } else if (event.key === "ArrowDown") {
+        event.preventDefault();
+        const next = currentRow.nextElementSibling as HTMLElement | null;
+        if (next?.matches("tr[tabindex]")) next.focus();
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        const prev = currentRow.previousElementSibling as HTMLElement | null;
+        if (prev?.matches("tr[tabindex]")) prev.focus();
+      }
+    };
+
+    const spanLinks = computed(() => {
+      try {
+        const parsedLinks =
+          typeof props.span.links === "string" ? JSON.parse(props.span.links) : props.span.links;
+
+        return parsedLinks || [];
+      } catch (e) {
+        console.log("Error parsing span links:", e);
+        // Return sample data even on error for testing
+        return [];
+      }
+    });
+
+    // Metric group definitions — controls which category tabs and default selections
+    // appear in the metrics dashboard. Uses K8S_METRIC_GROUP_DEFINITIONS for OTel
+    // semantic defaults; overrides the pods icon with the project-specific component.
+    const metricGroupResources = ref<MetricGroupDefinition[]>(
+      K8S_METRIC_GROUP_DEFINITIONS.map((g) => (g.id === "pods" ? { ...g, icon: DeployedCode } : g)),
+    );
+
+    // Correlation state
+    const correlationLoading = ref(false);
+    const correlationError = ref<string | null>(null);
+    // True when the lookup itself failed (request error, missing span/stream) as
+    // opposed to succeeding with nothing correlated — the two need different wording.
+    const correlationFailed = ref(false);
+    const correlationProps = ref<any>(null);
+    const { findRelatedTelemetry, loadSemanticGroups, semanticGroups } = useServiceCorrelation();
+
+    // Write correlation data to shared searchObj for TraceDetails to use
+    watch(correlationProps, (newVal) => {
+      searchObj.data.traceDetails.correlationProps = newVal;
+    });
+
+    /**
+     * Extract dimensions from span attributes for correlation
+     * Maps trace span attributes to semantic dimension names
+     */
+    const extractSpanDimensions = (span: any): Record<string, string> => {
+      const dimensions: Record<string, string> = {};
+
+      // Direct service name
+      if (span.service_name) {
+        dimensions["service-name"] = span.service_name;
+      }
+
+      // Common trace attributes that map to dimensions
+      const attributeMappings: Record<string, string> = {
+        // Kubernetes attributes
+        k8s_namespace_name: "k8s-namespace",
+        "k8s.namespace.name": "k8s-namespace",
+        k8s_deployment_name: "k8s-deployment",
+        "k8s.deployment.name": "k8s-deployment",
+        k8s_pod_name: "k8s-pod",
+        "k8s.pod.name": "k8s-pod",
+        k8s_container_name: "k8s-container",
+        "k8s.container.name": "k8s-container",
+        k8s_statefulset_name: "k8s-statefulset",
+        "k8s.statefulset.name": "k8s-statefulset",
+        k8s_daemonset_name: "k8s-daemonset",
+        "k8s.daemonset.name": "k8s-daemonset",
+        k8s_replicaset_name: "k8s-replicaset",
+        "k8s.replicaset.name": "k8s-replicaset",
+        k8s_job_name: "k8s-job",
+        "k8s.job.name": "k8s-job",
+        k8s_cronjob_name: "k8s-cronjob",
+        "k8s.cronjob.name": "k8s-cronjob",
+        k8s_node_name: "k8s-node",
+        "k8s.node.name": "k8s-node",
+        k8s_cluster_name: "k8s-cluster",
+        "k8s.cluster.name": "k8s-cluster",
+        // Host attributes
+        host_name: "host-name",
+        "host.name": "host-name",
+        // Cloud attributes
+        cloud_region: "cloud-region",
+        "cloud.region": "cloud-region",
+        cloud_availability_zone: "cloud-availability-zone",
+        "cloud.availability_zone": "cloud-availability-zone",
+        // Container attributes
+        container_name: "container-name",
+        "container.name": "container-name",
+        container_id: "container-id",
+        "container.id": "container-id",
+      };
+
+      // Check all span attributes
+      for (const [attrName, dimName] of Object.entries(attributeMappings)) {
+        if (span[attrName] && !dimensions[dimName]) {
+          dimensions[dimName] = String(span[attrName]);
+        }
+      }
+
+      return dimensions;
+    };
+
+    // Map a span row to a source-event severity label. Spans in this codebase
+    // expose span status as `span_status` ("OK" | "ERROR" | "UNSET"); fall back
+    // to OTel `status.code` (numeric, 2 = ERROR) and finally any severity-like
+    // text field on the span. Returns null when nothing classifiable is set.
+    const deriveSpanSeverity = (span: any): string | null => {
+      if (!span) return null;
+      const spanStatus =
+        typeof span.span_status === "string" ? span.span_status.toUpperCase() : null;
+      if (spanStatus === "ERROR") return "ERROR";
+      const otelStatusCode = span.status?.code ?? span.statusCode ?? span.status_code;
+      if (otelStatusCode === 2 || otelStatusCode === "ERROR") return "ERROR";
+      return normalizeSeverity(span.severity_text ?? span.severity);
+    };
+
+    /**
+     * Load correlation data for this span (called when user clicks on correlation tabs)
+     */
+    const loadCorrelation = async () => {
+      // Skip if already loaded or loading
+      if (correlationProps.value || correlationLoading.value) {
+        return;
+      }
+
+      // Gate correlation feature behind enterprise check to avoid 403 errors
+      if (config.isEnterprise !== "true") {
+        correlationError.value = t("traces.traceDetailsSidebar.enterpriseLicenseRequired");
+        correlationFailed.value = true;
+        return;
+      }
+
+      if (!props.span || !props.streamName) {
+        console.warn("[TraceDetailsSidebar] Cannot load correlation: missing span or stream name");
+        correlationError.value = t("traces.traceDetailsSidebar.missingSpanOrStream");
+        correlationFailed.value = true;
+        return;
+      }
+
+      correlationLoading.value = true;
+      correlationError.value = null;
+      correlationFailed.value = false;
+
+      try {
+        try {
+          await loadSemanticGroups();
+        } catch {
+          // Non-fatal: semantic groups are used for metrics tab label resolution.
+        }
+
+        // Build telemetry context from span
+        const context: TelemetryContext = {
+          timestamp: convertTimeFromNsToUs(props.span.start_time) * 1000, // Convert to nanoseconds
+          fields: { ...props.span },
+          streamName: props.streamName,
+        };
+
+        // Extract dimensions from span attributes
+        const spanDimensions = extractSpanDimensions(props.span);
+        // Merge span dimensions into context fields for semantic extraction
+        Object.assign(context.fields, spanDimensions);
+
+        // Find related telemetry
+        const result = await findRelatedTelemetry(
+          context,
+          "traces",
+          5, // 5 minute time window
+          props.streamName,
+        );
+
+        if (result && result.correlationData) {
+          const correlationData = result.correlationData;
+
+          // Calculate time range (span start/end with buffer)
+          const spanStartUs = convertTimeFromNsToUs(props.span.start_time);
+          const spanEndUs = convertTimeFromNsToUs(props.span.end_time);
+          const bufferUs = 5 * 60 * 1000000; // 5 minutes buffer
+
+          // Build availableDimensions from raw span attributes (actual field names)
+          // This is critical for log queries to use the correct field names (e.g., k8s_pod_name)
+          // Filter to only include string values that are correlation-relevant
+          const rawSpanDimensions: Record<string, string> = {};
+          for (const [key, value] of Object.entries(props.span)) {
+            if (typeof value !== "string" || !value) continue;
+            if (key.startsWith("_")) continue; // Skip internal fields
+
+            // Include known correlation-relevant dimensions
+            const isRelevant =
+              key.startsWith("k8s_") ||
+              key.startsWith("k8s.") ||
+              key.startsWith("host") ||
+              key.startsWith("container") ||
+              key.startsWith("pod") ||
+              key.startsWith("namespace") ||
+              key.startsWith("deployment") ||
+              key.startsWith("service") ||
+              key.startsWith("node") ||
+              key.startsWith("os_") ||
+              key === "version" ||
+              key === "region" ||
+              key === "cluster" ||
+              key === "environment" ||
+              key === "env";
+
+            if (isRelevant) {
+              rawSpanDimensions[key] = value;
+            }
+          }
+
+          // Use filters from logStreams[0] as matchedDimensions — these contain
+          // the correct field names for the log stream (e.g., k8s_namespace_name)
+          // instead of semantic IDs (k8s-namespace) or trace field names
+          // (service_k8s_namespace_name).
+          const logFilters = correlationData.related_streams.logs?.[0]?.filters || {};
+          const actualMatchedDimensions =
+            Object.keys(logFilters).length > 0 ? logFilters : correlationData.matched_dimensions;
+
+          correlationProps.value = {
+            serviceName: correlationData.service_name,
+            matchedDimensions: actualMatchedDimensions,
+            additionalDimensions: {},
+            matchedSetId: correlationData.matched_set_id,
+            chipDimensions: {
+              ...buildChipDimensionsFromFilters(correlationData, semanticGroups.value),
+              ...buildWorkloadChipDimensions(
+                correlationData.matched_set_id,
+                semanticGroups.value,
+                props.span as Record<string, any>,
+              ),
+            },
+            sourceEvent: {
+              timestamp: props.span?.start_time,
+              severity: deriveSpanSeverity(props.span) ?? undefined,
+              message: props.span?.operation_name,
+            },
+            metricStreams: correlationData.related_streams.metrics,
+            logStreams: correlationData.related_streams.logs,
+            traceStreams: correlationData.related_streams.traces,
+            sourceStream: props.streamName,
+            sourceType: "traces",
+            // Use log stream filters and log record as availableDimensions for field name resolution and traceId extraction
+            availableDimensions: { ...logFilters, ...context.fields },
+            // Lets filter edits resolve across streams that alias the same
+            // semantic group under different field names (F35).
+            semanticGroups: semanticGroups.value,
+            ftsFields: [],
+            timeRange: {
+              startTime: spanStartUs - bufferUs,
+              endTime: spanEndUs + bufferUs,
+            },
+          };
+        } else {
+          correlationError.value = t("correlation.noDataFound");
+        }
+      } catch (err: any) {
+        console.error("[TraceDetailsSidebar] Correlation failed:", err);
+        correlationError.value = err.message || t("correlation.failedToLoad");
+        correlationFailed.value = true;
+      } finally {
+        correlationLoading.value = false;
+      }
+    };
+
+    // Clear correlation when span changes
+    watch(
+      () => props.span,
+      () => {
+        correlationProps.value = null;
+        correlationError.value = null;
+        correlationFailed.value = false;
+
+        // Load correlation proactively so View Logs button has data
+        if (props.serviceStreamsEnabled) {
+          loadCorrelation();
+        }
+      },
+      { deep: true },
+    );
+
+    // Load correlation data when user clicks on correlation tabs
+    watch(activeTabModel, (newTab) => {
+      if (newTab === "correlated-logs" || newTab === "correlated-metrics") {
+        loadCorrelation();
+      }
+    });
+
+    // LLM-related computed properties
+    const llmMetrics = computed(() => {
+      if (!isLLMSpan.value) return null;
+      const usage = parseUsageDetails(props.span);
+      const cost = parseCostDetails(props.span);
+      return {
+        usage: usage,
+        cost: cost,
+      };
+    });
+
+    // Copy LLM content to clipboard
+    const copyContent = (content: any, type: "input" | "output") => {
+      try {
+        // Convert content to string
+        let textToCopy = "";
+        if (typeof content === "string") {
+          textToCopy = content;
+        } else if (content) {
+          // Pretty-print JSON objects/arrays
+          textToCopy = JSON.stringify(content, null, 2);
+        }
+
+        // Copy to clipboard
+        copyToClipboard(textToCopy, t, {
+          successMessage: t("traces.traceDetailsSidebar.copiedToClipboard", {
+            type: type.charAt(0).toUpperCase() + type.slice(1),
+          }),
+          errorMessage: t("traces.traceDetailsSidebar.failedToCopyClipboard"),
+        });
+      } catch (error) {
+        toast({
+          variant: "error",
+          message: t("traces.traceDetailsSidebar.failedToCopyContent"),
+        });
+      }
+    };
+
+    // Helper function to check if content exists
+    const hasContent = (content: any) => {
+      // Check for null, undefined
+      if (content === null || content === undefined) return false;
+
+      // Check for empty or "null" string (case insensitive)
+      if (typeof content === "string") {
+        const trimmed = content.trim();
+        if (trimmed === "" || trimmed.toLowerCase() === "null") return false;
+      }
+
+      // Check for empty arrays
+      if (Array.isArray(content) && content.length === 0) return false;
+
+      // Check for empty objects (but not arrays or objects with properties)
+      if (
+        typeof content === "object" &&
+        !Array.isArray(content) &&
+        Object.keys(content).length === 0
+      )
+        return false;
+
+      // Check if JSON stringified content is null/empty
+      try {
+        const stringified = JSON.stringify(content);
+        if (stringified === "null" || stringified === "{}" || stringified === "[]") return false;
+      } catch (e) {
+        // If stringify fails, continue with other checks
+      }
+
+      return true;
+    };
+
+    const parsedSystemInstructions = computed(() => {
+      const raw = props.span?.gen_ai_system_instructions;
+      if (!raw) return null;
+      try {
+        let parsed;
+        if (typeof raw === "string") {
+          parsed = JSON.parse(raw);
+        } else {
+          parsed = raw;
+        }
+        if (Array.isArray(parsed)) {
+          // filter drops both null (unsupported part type) and "" (no content); "" from join -> null so callers get one consistent falsy value.
+          return (
+            parsed
+              .map((p: any) => extractGenAiPartText(p))
+              .filter((text): text is string => !!text)
+              .join("\n") || null
+          );
+        }
+        return null;
+      } catch {
+        return typeof raw === "string" ? raw : null;
+      }
+    });
+
+    // Toggle fullscreen for both Input and Output side by side
+    const toggleFullscreen = () => {
+      if (ioContainerRef.value) {
+        domToggleFullScreen(ioContainerRef.value)
+          .then(() => {
+            // Check if this specific element is now fullscreen
+            nextTick(() => {
+              isFullscreen.value = document.fullscreenElement === ioContainerRef.value;
+            });
+          })
+          .catch((err: any) => {
+            console.error("Failed to toggle fullscreen:", err);
+          });
+      }
+    };
+
+    // Listen for fullscreen changes (e.g., when user presses Escape)
+    onMounted(() => {
+      const handleFullscreenChange = () => {
+        // Check if the IO container is in fullscreen
+        isFullscreen.value = document.fullscreenElement === ioContainerRef.value;
+      };
+
+      // Listen to fullscreen change events
+      document.addEventListener("fullscreenchange", handleFullscreenChange);
+      document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
+      document.addEventListener("mozfullscreenchange", handleFullscreenChange);
+      document.addEventListener("MSFullscreenChange", handleFullscreenChange);
+
+      // Cleanup listeners on unmount
+      onUnmounted(() => {
+        document.removeEventListener("fullscreenchange", handleFullscreenChange);
+        document.removeEventListener("webkitfullscreenchange", handleFullscreenChange);
+        document.removeEventListener("mozfullscreenchange", handleFullscreenChange);
+        document.removeEventListener("MSFullscreenChange", handleFullscreenChange);
+      });
+    });
+
+    // Format model parameters for display
+    const formatModelParams = (params: any) => {
+      return formatModelParameters(params, t);
+    };
+
+    const serviceIconUrl = computed(() =>
+      getServiceIconDataUrl(
+        props.span?.service_name ?? "",
+        isDarkMode.value,
+        props.span ? getOrSetServiceColor(resolveSpanIdentity(props.span)) : "#9e9e9e",
+      ),
+    );
+
+    const copyContentToClipboard = (log: any) => {
+      copyToClipboard(JSON.stringify(log), t, {
+        successMessage: t("traces.traceDetailsSidebar.contentCopied"),
+        timeout: 1000,
+      });
+    };
+
+    return {
+      t,
+      activeTabModel,
+      filterActions,
+      closeSidebar,
+      eventColumns,
+      eventsWrap,
+      eventsTableColumns,
+      eventsRowsWithKey,
+      eventsTableRef,
+      focusEvent,
+      expandedEventIds,
+      spanEventMarkers,
+      eventMarkerLabel,
+      onEventMarkerClick,
+      eventTimelineRef,
+      onEventTimelineResize,
+      spanEventClusters,
+      clusterLabel,
+      clusterAriaLabel,
+      SEVERITY_MARKER_CLASS,
+      pagination,
+      spanDetails,
+      store,
+      tags,
+      hasExceptionEvents,
+      hasSpanError,
+      spanHttpResendCount,
+      navigateToError,
+      getDuration,
+      getTTFT,
+      viewSpanLogs,
+      evaluateSpan,
+      addSpanToDataset,
+      canOpenPlayground,
+      openInPlayground,
+      spanStartTimeUs,
+      spanSourceStream,
+      getStartTime,
+      copySpanId,
+      copyAttributesToClipboard,
+      openReferenceTrace,
+      onLinkRowKeydown,
+      spanLinks,
+      linkColumns,
+      getTagRows,
+      tagColumns,
+      getFilterValue,
+      attributesForDisplay,
+      attributesViewMode,
+      attributesTableColumns,
+      attributesTableRows,
+      highlightTextMatch,
+      highlightedJSON,
+      // Correlation
+      correlationLoading,
+      correlationError,
+      correlationProps,
+      metricGroupResources,
+      config,
+      // LLM
+      isLLMSpan,
+      canPreviewSpan,
+      previewInput,
+      previewOutput,
+      previewOperationName,
+      hasDbSpan,
+      llmMetrics,
+      copyContent,
+      formatModelParams,
+      getObservationTypeColor,
+      hasContent,
+      sysInstrOpen,
+      modelParamsOpen,
+      parsedSystemInstructions,
+      ioContainerRef,
+      isFullscreen,
+      toggleFullscreen,
+      isDarkMode,
+      isViewLogsDisabled,
+      viewLogsTooltipContent,
+      serviceIconUrl,
+      getImageURL,
+      copyContentToClipboard,
+    };
+  },
+});
+</script>
+
+<style scoped>
+/* keep(complex-state): Deliberate CSS — generated content the template can't class up,
+   child-component internals reached with :deep(), :fullscreen chains, and
+   scrollbar rails. */
+
+/* generated-content — highlightedJSON()/highlightTextMatch() build these spans
+   as HTML strings, so scoped classes can't reach them; colours come from the
+   registered --color-json-* tokens and flip with the theme on their own. */
+.trace-details-sidebar {
+  :deep(.trace-json-key) {
+    color: var(--color-json-key);
+  }
+
+  :deep(.trace-json-string) {
+    color: var(--color-json-string);
+  }
+
+  :deep(.trace-json-number) {
+    color: var(--color-json-number);
+  }
+
+  :deep(.trace-json-boolean) {
+    color: var(--color-json-boolean);
+  }
+
+  :deep(.trace-json-null) {
+    color: var(--color-json-null);
+  }
+
+  :deep(.trace-json-object) {
+    color: var(--color-json-object);
+  }
+
+  :deep(.trace-json-punct) {
+    color: var(--color-text-label);
+  }
+
+  :deep(.trace-sidebar-highlight) {
+    background-color: var(--color-table-highlight-bg);
+  }
+}
+
+/* .trace-detail-tab-table is also worn by TraceErrorTab.vue's table, which only
+   ever renders inside this sidebar — anchoring under the root keeps both
+   reachable without the bare th/td restyle leaking app-wide. */
+.trace-details-sidebar :deep(.trace-detail-tab-table) {
+  th,
+  td {
+    /* eslint-disable-next-line local/no-hardcoded-px -- hairline: a 1-device-pixel table cell divider must not scale with text or it smears at fractional zoom */
+    border-bottom: 1px solid var(--color-table-row-divider);
+    /* eslint-disable-next-line local/no-hardcoded-px -- hairline: a 1-device-pixel table cell divider must not scale with text or it smears at fractional zoom */
+    border-right: 1px solid var(--color-table-row-divider);
+    text-align: left;
+    padding: 0.5rem;
+    font-size: var(--text-compact);
+    word-break: break-word;
+    overflow-wrap: break-word;
+    min-height: 1.5rem;
+    height: auto;
+    max-width: 37.5rem;
+  }
+
+  th {
+  }
+
+  th:first-child,
+  td:first-child {
+    width: 12.5rem;
+    min-width: 12.5rem;
+  }
+
+  th:nth-child(2),
+  td:nth-child(2) {
+    width: auto;
+    min-width: 6.25rem;
+  }
+
+  th:last-child,
+  td:last-child {
+    border-right: none;
+  }
+
+  tr:last-child td {
+    border-bottom: none;
+  }
+
+  td span {
+    display: inline-block;
+    width: 100%;
+    word-break: break-word;
+    overflow-wrap: break-word;
+    white-space: pre-wrap;
+  }
+
+  tbody tr:first-child {
+    td:first-child {
+      border-top-left-radius: var(--radius-surface);
+    }
+
+    td:last-child {
+      border-top-right-radius: var(--radius-surface);
+    }
+  }
+
+  tbody tr:last-child {
+    td:first-child {
+      border-bottom-left-radius: var(--radius-surface);
+    }
+
+    td:last-child {
+      border-bottom-right-radius: var(--radius-surface);
+    }
+  }
+}
+
+/* scrollbar — both toolbar rows overflow horizontally */
+.trace-details-toolbar-container > div {
+  &::-webkit-scrollbar {
+    height: 0.25rem;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: var(--color-scrollbar-thumb);
+    border-radius: 0.125rem;
+
+    &:hover {
+      background: var(--color-scrollbar-thumb-hover);
+    }
+  }
+}
+
+/* complex-state — :fullscreen chains on the LLM input/output panes */
+.llm-preview-container {
+  .io-container:fullscreen {
+    padding: 0.75rem;
+    height: 100vh;
+    max-height: 100vh;
+    display: flex;
+    gap: 0.5rem;
+    align-items: stretch;
+
+    .io-section {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+
+      .section-label {
+        border-radius: var(--radius-default);
+      }
+
+      .llm-content-box {
+        height: calc(100vh - 5rem);
+        max-height: unset;
+        min-height: unset;
+      }
+    }
+  }
+
+  /* generated-content — LLMContentRenderer output rendered inside the box */
+  :deep(.llm-content-box .plain-text-content:hover) {
+    background-color: var(--color-interactive-hover-bg) !important;
+  }
+
+  /* lib-override:vue-json-pretty — suppress the library's own row hover */
+  :deep(.llm-content-box .vjs-tree *:hover) {
+    background-color: transparent !important;
+  }
+}
+
+/* child-component internals */
+.span_details_tab-panels :deep(.o-tab-panel) {
+  height: 100%;
+}
+
+.traces-correlated-metrics-container {
+  :deep(.dimension-sidebar) {
+    padding-left: 0.25rem;
+  }
+
+  :deep(.dimension-sidebar-search-container) {
+    padding: 0.375rem 0.2rem !important;
+  }
+}
+
+.traces-correlated-logs-container :deep(.logs-table-container .o2-scroll-container) {
+  height: 100% !important;
+}
+
+.traces-events-table-container :deep(.table-container) {
+  border-radius: 0 !important;
+}
+/* sticky header cells for the links table — position:sticky must sit on the
+   cells (tr > *), not the <thead>, so it cannot be a utility on the thead
+   element this template owns. */
+.thead-sticky tr > * {
+  position: sticky;
+  opacity: 1;
+  z-index: 1;
+}
+
+.thead-sticky tr:last-child > * {
+  top: 0;
+}
+</style>

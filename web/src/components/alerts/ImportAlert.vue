@@ -1,0 +1,1197 @@
+﻿<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <BaseImport
+    ref="baseImportRef"
+    :title="t('alerts.importAlertTitle')"
+    test-prefix="alert"
+    class="min-h-0 flex-1"
+    :is-importing="isAlertImporting"
+    @back="router.back()"
+    @cancel="router.back()"
+    @import="importJson"
+  >
+    <!-- Custom URL Input Section with Folder Dropdown -->
+    <template #url-input-section="{ url, updateUrl }">
+      <div class="my-[0.725rem] flex items-end gap-2">
+        <div class="w-[69%]">
+          <OInput
+            data-test="alert-import-url-input"
+            :model-value="url"
+            size="md"
+            @update:model-value="updateUrl"
+            :label="t('dashboard.addURL')"
+          />
+        </div>
+
+        <div class="w-[30%]" data-test="alert-folder-dropdown">
+          <SelectFolderDropDown
+            :type="'alerts'"
+            @folder-selected="updateActiveFolderId"
+            :activeFolderId="activeFolderId"
+          />
+        </div>
+      </div>
+    </template>
+
+    <!-- Custom File Input Section with Folder Dropdown -->
+    <template #file-input-section="{ jsonFiles, updateFiles }">
+      <div class="mb-1 flex w-[calc(100%-0.625rem)] items-start gap-2">
+        <div class="w-[69%]">
+          <OFile
+            data-test="alert-import-json-file-input"
+            :model-value="jsonFiles"
+            @update:model-value="updateFiles"
+            :label="t('dashboard.dropFileMsg')"
+            accept=".json"
+            multiple
+            drop-zone
+            :help-text="t('alerts.jsonFilesOnlyHint')"
+            size="md"
+          />
+        </div>
+        <div class="w-[30%]">
+          <SelectFolderDropDown
+            :type="'alerts'"
+            @folder-selected="updateActiveFolderId"
+            :activeFolderId="activeFolderId"
+          />
+        </div>
+      </div>
+    </template>
+
+    <!-- Output Section with Alert-specific Error Display -->
+    <template #output-content>
+      <div class="border-border-default flex h-full w-full min-w-100 flex-col border-s">
+        <div
+          v-if="alertErrorsToDisplay.length > 0"
+          class="text-text-heading shrink-0 py-3 text-center text-sm font-semibold"
+        >
+          {{ t("dashboard.importDashboardPage.errorValidations") }}
+        </div>
+        <div v-else class="text-text-heading shrink-0 py-3 text-center text-sm font-semibold">
+          {{ t("alerts.outputMessages") }}
+        </div>
+        <OSeparator class="mt-1 shrink-0" />
+        <div class="error-report-container min-h-0 flex-1 resize-none overflow-auto">
+          <!-- Alert Errors Section -->
+          <div class="mb-2.5 p-2.5" v-if="alertErrorsToDisplay.length > 0">
+            <div class="error-list">
+              <!-- Iterate through the outer array -->
+              <div
+                v-for="(errorGroup, index) in alertErrorsToDisplay"
+                :key="index"
+                :data-test="`alert-import-error-${index}`"
+              >
+                <!-- Iterate through each inner array (the individual error message) -->
+                <div
+                  v-for="(errorMessage, errorIndex) in errorGroup"
+                  :key="errorIndex"
+                  class="px-0 py-1.25 text-sm"
+                  :data-test="`alert-import-error-${index}-${errorIndex}`"
+                >
+                  <span
+                    class="text-status-negative"
+                    v-if="typeof errorMessage === 'object' && errorMessage.field == 'alert_name'"
+                  >
+                    {{ errorMessage.message }}
+
+                    <div class="w-75">
+                      <OInput
+                        data-test="alert-import-name-input"
+                        :model-value="userSelectedAlertName[index] || ''"
+                        :label="raw(t('alerts.name') + ' *')"
+                        :error="!userSelectedAlertName[index]?.toString().trim()"
+                        :error-message="t('alerts.validation.fieldRequired')"
+                        @update:model-value="
+                          (val) => {
+                            userSelectedAlertName[index] = val as string;
+                            updateAlertName(val as string, index);
+                          }
+                        "
+                      />
+                    </div>
+                  </span>
+                  <!-- Check if the errorMessage is an object, if so, display the 'message' property -->
+                  <span
+                    class="text-status-negative"
+                    v-else-if="
+                      typeof errorMessage === 'object' && errorMessage.field == 'stream_name'
+                    "
+                  >
+                    {{ errorMessage.message }}
+                    <div class="w-75">
+                      <OSelect
+                        data-test="alert-import-stream-name-input"
+                        :model-value="userSelectedStreamName[index] || ''"
+                        :options="streamList"
+                        :label="raw(t('alerts.stream_name') + ' *')"
+                        searchable
+                        :error="!userSelectedStreamName[index]"
+                        :error-message="t('alerts.validation.fieldRequired')"
+                        @update:model-value="
+                          (val) => {
+                            userSelectedStreamName[index] = val as string;
+                            updateStreamFields(val as string, index);
+                          }
+                        "
+                      />
+                    </div>
+                  </span>
+                  <span
+                    class="text-status-negative"
+                    v-else-if="
+                      typeof errorMessage === 'object' && errorMessage.field == 'destination_name'
+                    "
+                  >
+                    {{ errorMessage.message }}
+                    <div>
+                      <OSelect
+                        data-test="alert-import-destination-name-input"
+                        :model-value="userSelectedDestinations[index] || []"
+                        :options="filteredDestinations"
+                        :label="t('alerts.destinationsRequiredLabel')"
+                        multiple
+                        searchable
+                        @search="filterDestinations"
+                        class="w-75!"
+                        :error="!userSelectedDestinations[index]?.length"
+                        :error-message="t('alerts.validation.fieldRequired')"
+                        @update:model-value="
+                          (val) => {
+                            userSelectedDestinations[index] = val as string[];
+                            updateUserSelectedDestinations(val as string[], index);
+                          }
+                        "
+                      />
+                    </div>
+                  </span>
+                  <span
+                    class="text-status-negative"
+                    v-else-if="
+                      typeof errorMessage === 'object' && errorMessage.field == 'stream_type'
+                    "
+                  >
+                    {{ errorMessage.message }}
+                    <div>
+                      <OSelect
+                        data-test="alert-import-stream-type-input"
+                        :model-value="userSelectedStreamType[index] || ''"
+                        :options="streamTypes"
+                        :label="raw(t('alerts.streamType') + ' *')"
+                        class="w-75!"
+                        :error="!userSelectedStreamType[index]"
+                        :error-message="t('alerts.validation.fieldRequired')"
+                        @update:model-value="
+                          (val) => {
+                            userSelectedStreamType[index] = val as string;
+                            updateStreams(val as string, index);
+                          }
+                        "
+                      />
+                    </div>
+                  </span>
+                  <span
+                    class="text-status-negative"
+                    v-else-if="typeof errorMessage === 'object' && errorMessage.field == 'timezone'"
+                  >
+                    {{ errorMessage.message }}
+                    <div>
+                      <OSelect
+                        data-test="alert-import-timezone-input"
+                        :model-value="userSelectedTimezone[index] || ''"
+                        :options="timezoneSelectOptions"
+                        :label="t('alerts.timezoneRequiredLabel')"
+                        searchable
+                        @search="timezoneFilterFn"
+                        class="w-75!"
+                        :error="!userSelectedTimezone[index]"
+                        :error-message="t('alerts.validation.fieldRequired')"
+                        @update:model-value="
+                          (val) => {
+                            userSelectedTimezone[index] = val as string;
+                            updateTimezone(val as string, index);
+                          }
+                        "
+                      />
+                    </div>
+                  </span>
+                  <span
+                    class="text-status-negative"
+                    v-else-if="typeof errorMessage === 'object' && errorMessage.field == 'org_id'"
+                  >
+                    {{ errorMessage.message }}
+                    <div class="w-75">
+                      <OSelect
+                        data-test="alert-import-org-id-input"
+                        :model-value="userSelectedOrgId[index] || null"
+                        :options="organizationDataList"
+                        :label="t('alerts.organizationIdLabel')"
+                        labelKey="label"
+                        valueKey="value"
+                        @update:model-value="
+                          (val) => {
+                            userSelectedOrgId[index] = val;
+                            updateOrgId(
+                              ((val as unknown as { value?: string })?.value || val) as string,
+                              index,
+                            );
+                          }
+                        "
+                      />
+                    </div>
+                  </span>
+
+                  <span v-else>{{ errorMessage }}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="mb-2.5 p-2.5" v-if="alertCreators.length > 0">
+            <div class="text-primary mb-2.5 text-base" data-test="alert-import-creation-title">
+              {{ t("alerts.alertCreationTitle") }}
+            </div>
+            <div
+              class="error-list"
+              v-for="(val, index) in alertCreators"
+              :key="index"
+              :data-test="`alert-import-creation-${index}`"
+            >
+              <div
+                :class="{
+                  'px-0 py-1.25 text-sm font-bold': true,
+                  'text-green': val.success,
+                  'text-status-negative': !val.success,
+                }"
+                :data-test="`alert-import-creation-${index}-message`"
+              >
+                <pre>{{ val.message }}</pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </template>
+  </BaseImport>
+</template>
+
+<script lang="ts">
+import { defineComponent, ref, onMounted, computed, watch } from "vue";
+import { raw, useI18nTyped, type I18nText } from "@/types/i18n";
+import { useStore } from "vuex";
+import { useRouter } from "vue-router";
+import alertsService from "../../services/alerts";
+import anomalyDetectionService from "../../services/anomaly_detection";
+import useStreams from "@/composables/useStreams";
+import BaseImport from "../common/BaseImport.vue";
+import SelectFolderDropDown from "../common/sidebar/SelectFolderDropDown.vue";
+import OInput from "@/lib/forms/Input/OInput.vue";
+import OSelect from "@/lib/forms/Select/OSelect.vue";
+import OFile from "@/lib/forms/File/OFile.vue";
+import { toast } from "@/lib/feedback/Toast/useToast";
+import OSeparator from "@/lib/core/Separator/OSeparator.vue";
+import {
+  detectConditionsVersion,
+  convertV0ToV2,
+  convertV1ToV2,
+  convertV1BEToV2,
+  ensureUnaryConditionValues,
+} from "@/utils/alerts/alertDataTransforms";
+import { isUnaryOperator } from "@/utils/alerts/conditionsFormatter";
+
+export default defineComponent({
+  name: "ImportAlert",
+  components: {
+    OSeparator,
+    BaseImport,
+    SelectFolderDropDown,
+    OInput,
+    OSelect,
+    OFile,
+  },
+  props: {
+    destinations: {
+      type: Array,
+      default: () => [],
+    },
+    templates: {
+      type: Array,
+      default: () => [],
+    },
+    alerts: {
+      type: Array,
+      default: () => [],
+    },
+    folderId: {
+      type: String,
+      default: "",
+    },
+  },
+  emits: ["update:destinations", "update:templates", "update:alerts"],
+  setup(props, { emit }) {
+    type ErrorMessage = {
+      field: string;
+      message: I18nText;
+    };
+    type alertCreator = {
+      message: I18nText;
+      success: boolean;
+    }[];
+
+    type AlertErrors = (ErrorMessage | string)[][];
+    const { t } = useI18nTyped();
+    const store = useStore();
+    const router = useRouter();
+
+    const { getStreams } = useStreams(t);
+
+    const baseImportRef = ref<any>(null);
+    const alertErrorsToDisplay = ref<AlertErrors>([]);
+    const templateErrorsToDisplay = ref<any>([]);
+    const destinationErrorsToDisplay = ref<any>([]);
+    const userSelectedDestinations = ref<string[][]>([]);
+    const userSelectedAlertName = ref<string[]>([]);
+
+    const alertCreators = ref<alertCreator>([]);
+    const destinationCreators = ref<any>([]);
+    const streamList = ref<any>([]);
+    const streams = ref<any>({});
+    const userSelectedStreamName = ref<string[]>([]);
+    const userSelectedStreamType = ref<string[]>([]);
+    const filteredDestinations = ref<string[]>([]);
+
+    // Use computed to directly reference BaseImport's jsonArrayOfObj
+    const jsonArrayOfObj = computed({
+      get: () => baseImportRef.value?.jsonArrayOfObj || [],
+      set: (val) => {
+        if (baseImportRef.value) {
+          baseImportRef.value.jsonArrayOfObj = val;
+        }
+      },
+    });
+    const streamTypes = ["logs", "metrics", "traces"];
+    const selectedFolderId = ref<any>(
+      props.folderId || router.currentRoute.value.query.folder || "default",
+    );
+    const activeFolderId = ref(
+      props.folderId ||
+        router.currentRoute.value.query.folder ||
+        router.currentRoute.value.query?.folderId,
+    );
+    const activeFolderAlerts = ref<any>([]);
+    const isAlertImporting = ref(false);
+    const userSelectedOrgId = ref<any[]>([]);
+    const organizationDataList = computed(() => {
+      return store.state.organizations.map((org: any) => {
+        return {
+          label: raw(org.identifier),
+          value: org.identifier,
+          disabled:
+            !org.identifier || org.identifier !== store.state.selectedOrganization.identifier,
+        };
+      });
+    });
+
+    const getFormattedDestinations: any = computed(() => {
+      return props.destinations.map((destination: any) => {
+        return destination.name;
+      });
+    });
+
+    // Keep filteredDestinations in sync with the destinations prop so the
+    // dropdown is pre-populated on first open (OSelect @search only fires
+    // on user input, not on initial open).
+    watch(
+      () => props.destinations,
+      () => {
+        filteredDestinations.value = getFormattedDestinations.value;
+      },
+      { immediate: true, deep: true },
+    );
+
+    const userSelectedTimezone = ref<string[]>([]);
+
+    // @ts-ignore
+    let timezoneOptions = Intl.supportedValuesOf("timeZone").map((tz: any) => {
+      return tz;
+    });
+    const filteredTimezone = ref<any>([]);
+    filteredTimezone.value = [...timezoneOptions];
+
+    const browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const browserTime = raw("Browser Time (" + browserTz + ")");
+
+    // Add the UTC option
+    timezoneOptions.unshift("UTC");
+    timezoneOptions.unshift(browserTime);
+
+    const timezoneSelectOptions = computed(() =>
+      (filteredTimezone.value as string[]).map((tz: string) =>
+        tz === browserTime
+          ? { label: t("common.browserTimeWithZone", { zone: browserTz }), value: tz }
+          : { label: raw(tz), value: tz },
+      ),
+    );
+
+    const updateUserSelectedDestinations = (destinations: string[], index: number) => {
+      if (baseImportRef.value?.jsonArrayOfObj[index]) {
+        baseImportRef.value.jsonArrayOfObj[index].destinations = destinations;
+        // Directly update jsonStr without triggering editor re-render
+        baseImportRef.value.jsonStr = JSON.stringify(baseImportRef.value.jsonArrayOfObj, null, 2);
+      }
+    };
+
+    const updateStreamFields = (stream_name: string, index: number) => {
+      if (baseImportRef.value?.jsonArrayOfObj[index]) {
+        baseImportRef.value.jsonArrayOfObj[index].stream_name = stream_name;
+        // Directly update jsonStr without triggering editor re-render
+        baseImportRef.value.jsonStr = JSON.stringify(baseImportRef.value.jsonArrayOfObj, null, 2);
+      }
+    };
+
+    const updateAlertName = (alertName: string, index: number) => {
+      if (baseImportRef.value?.jsonArrayOfObj[index]) {
+        baseImportRef.value.jsonArrayOfObj[index].name = alertName;
+        // Directly update jsonStr without triggering editor re-render
+        baseImportRef.value.jsonStr = JSON.stringify(baseImportRef.value.jsonArrayOfObj, null, 2);
+      }
+    };
+
+    onMounted(() => {
+      activeFolderId.value =
+        props.folderId ||
+        router.currentRoute.value.query?.folder ||
+        router.currentRoute.value.query?.folderId;
+      getActiveFolderAlerts(activeFolderId.value as string);
+    });
+
+    const importJson = async ({ jsonStr: jsonString }: any) => {
+      alertErrorsToDisplay.value = [];
+      templateErrorsToDisplay.value = [];
+      destinationErrorsToDisplay.value = [];
+      alertCreators.value = [];
+      destinationCreators.value = [];
+
+      try {
+        // Check if jsonStr is empty or null
+        if (!jsonString || jsonString.trim() === "") {
+          throw new Error(t("alerts.import.jsonStringEmpty"));
+        }
+
+        const parsedJson = JSON.parse(jsonString);
+        // Convert single object to array if needed
+        jsonArrayOfObj.value = Array.isArray(parsedJson) ? parsedJson : [parsedJson];
+      } catch (e: any) {
+        toast({
+          variant: "error",
+          message: e.message || t("alerts.import.invalidJsonFormat"),
+        });
+        // Reset BaseImport's importing flag on validation error
+        if (baseImportRef.value) {
+          baseImportRef.value.isImportingLocal = false;
+        }
+        return;
+      }
+
+      let allAlertsCreated = true;
+      isAlertImporting.value = true;
+
+      // Process each object in the array
+      for (const [index, jsonObj] of jsonArrayOfObj.value.entries()) {
+        const success = await processJsonObject(jsonObj, index + 1);
+        if (!success) {
+          allAlertsCreated = false;
+        }
+      }
+
+      if (allAlertsCreated) {
+        toast({
+          variant: "success",
+          message: t("toastMessages.alerts.alertsImportedSuccessfully", {
+            count: jsonArrayOfObj.value.length,
+          }),
+        });
+
+        // Delay navigation to allow Monaco editor to complete all debounced operations
+        // Monaco has a 300ms debounce, so we wait 400ms to be safe
+        setTimeout(() => {
+          router.push({
+            name: "alertList",
+            query: {
+              org_identifier: store.state.selectedOrganization.identifier,
+              folder: selectedFolderId.value,
+            },
+          });
+        }, 400);
+      }
+
+      isAlertImporting.value = false;
+
+      // Reset BaseImport's importing flag
+      if (baseImportRef.value) {
+        baseImportRef.value.isImportingLocal = false;
+      }
+    };
+
+    const importAnomalyConfig = async (jsonObj: any, index: number) => {
+      try {
+        const org = store.state.selectedOrganization.identifier;
+        // Convert the exported anomaly config (GET format) back to the create (POST) format.
+        const payload: any = {
+          alert_type: "anomaly_detection",
+          name: jsonObj.name,
+          stream_name: jsonObj.stream_name,
+          stream_type: jsonObj.stream_type,
+          destinations: [],
+          anomaly_config: {
+            detection_function: jsonObj.detection_function,
+            histogram_interval: jsonObj.histogram_interval,
+            schedule_interval: jsonObj.schedule_interval,
+            detection_window_seconds: jsonObj.detection_window_seconds,
+            training_window_days: jsonObj.training_window_days,
+            retrain_interval_days: jsonObj.retrain_interval_days ?? 0,
+            threshold: jsonObj.threshold ?? 97,
+            seasonality: jsonObj.seasonality ?? "none",
+            query_mode: jsonObj.query_mode ?? "filters",
+            filters: jsonObj.filters ?? [],
+            custom_sql: jsonObj.custom_sql ?? "",
+            alert_destinations: jsonObj.alert_destinations ?? [],
+            alert_enabled: jsonObj.alert_enabled ?? true,
+          },
+        };
+        await anomalyDetectionService.create(org, payload);
+        alertCreators.value.push({
+          message: t("alerts.import.anomalyImportSuccess", { index, name: jsonObj.name }),
+          success: true,
+        });
+        return true;
+      } catch (e: any) {
+        alertCreators.value.push({
+          message: t("alerts.import.anomalyImportFailed", {
+            index,
+            name: jsonObj.name,
+            reason: e?.response?.data?.message || t("alerts.import.unknownError"),
+          }),
+          success: false,
+        });
+        return false;
+      }
+    };
+
+    const processJsonObject = async (jsonObj: any, index: number) => {
+      try {
+        // Anomaly detection configs have anomaly_id — route to separate import path.
+        // Regular alert flow is completely unchanged.
+        if (jsonObj.anomaly_id !== undefined) {
+          return await importAnomalyConfig(jsonObj, index);
+        }
+
+        const isValidAlert = await validateAlertInputs(jsonObj, index);
+        if (!isValidAlert) {
+          return false;
+        }
+
+        if (alertErrorsToDisplay.value.length === 0 && isValidAlert) {
+          return await createAlert(jsonObj, index, selectedFolderId.value);
+        }
+      } catch (e: any) {
+        toast({
+          variant: "error",
+          message: t("toastMessages.alerts.errorImportingAlertPleaseCheck"),
+        });
+        return false;
+      }
+      return false;
+    };
+
+    const validateAlertInputs = async (input: any, index: number) => {
+      let alertErrors: (string | ErrorMessage)[] = [];
+
+      // 1. Validate 'name' field
+      if (!input.name || typeof input.name !== "string" || input.name.trim() === "") {
+        alertErrors.push({
+          message: t("alerts.import.nameRequired", { index }),
+          field: "alert_name",
+        });
+      }
+
+      // 2. Validate 'org_id' field
+      if (
+        !input.org_id ||
+        typeof input.org_id !== "string" ||
+        input.org_id.trim() === "" ||
+        input.org_id != store.state.selectedOrganization.identifier
+      ) {
+        alertErrors.push({
+          message: t("alerts.import.orgIdInvalid", {
+            index,
+            orgId: store.state.selectedOrganization.identifier,
+          }),
+          field: "org_id",
+        });
+      }
+
+      // 3. Validate 'stream_type' field
+      const validStreamTypes = ["logs", "metrics", "traces"];
+      if (!input.stream_type || !validStreamTypes.includes(input.stream_type)) {
+        alertErrors.push({
+          message: t("alerts.import.streamTypeInvalid", { index }),
+          field: "stream_type",
+        });
+      }
+
+      try {
+        const streamResponse: any = await getStreams(input.stream_type, false);
+        streamList.value = streamResponse.list.map((stream: any) => stream.name);
+      } catch (e) {
+        const err: any = {
+          message: t("alerts.import.streamListFetchFailed", { index }),
+          field: "stream_list",
+        };
+        alertErrors.push(err);
+      }
+
+      // 4. Validate 'stream_name' field
+      if (
+        !input.stream_name ||
+        typeof input.stream_name !== "string" ||
+        !streamList.value.includes(input.stream_name)
+      ) {
+        alertErrors.push({
+          message: t("alerts.import.streamNameInvalid", { index }),
+          field: "stream_name",
+        });
+      }
+
+      // 5. Validate 'is_real_time' field
+      if (typeof input.is_real_time !== "boolean") {
+        alertErrors.push(t("alerts.import.isRealTimeBoolean", { index }));
+      }
+
+      // 6. Validate 'query_condition' field
+      if (input.query_condition && input.query_condition.conditions) {
+        const validateV2Condition = (item: any): boolean => {
+          if (item.filterType === "group") {
+            // V2 group - validate it has conditions array
+            if (!Array.isArray(item.conditions)) {
+              alertErrors.push(t("alerts.import.v2GroupConditionsArray", { index }));
+              return false;
+            }
+            // Recursively validate nested conditions
+            return item.conditions.every((nestedItem: any) => validateV2Condition(nestedItem));
+          } else if (item.filterType === "condition") {
+            // V2 condition - validate required fields
+            if (
+              !item.column ||
+              !item.operator ||
+              (item.value === undefined && !isUnaryOperator(item.operator))
+            ) {
+              alertErrors.push(t("alerts.import.v2ConditionFieldsRequired", { index }));
+              return false;
+            }
+            // Validate operator for custom type
+            if (
+              input.query_condition.type === "custom" &&
+              ![
+                "=",
+                "!=",
+                ">",
+                "<",
+                ">=",
+                "<=",
+                "Contains",
+                "NotContains",
+                "contains",
+                "not_contains",
+              ].includes(item.operator) &&
+              !isUnaryOperator(item.operator)
+            ) {
+              alertErrors.push(
+                t("alerts.import.invalidOperator", { index, operator: item.operator }),
+              );
+              return false;
+            }
+            return true;
+          }
+          return true;
+        };
+
+        const validateV1Condition = (condition: any) => {
+          // Check if it's a simple condition (V0/V1 format)
+          if (
+            condition.column &&
+            condition.operator &&
+            (condition.value !== undefined || isUnaryOperator(condition.operator))
+          ) {
+            if (
+              input.query_condition.type === "custom" &&
+              ![
+                "=",
+                "!=",
+                ">",
+                "<",
+                ">=",
+                "<=",
+                "Contains",
+                "NotContains",
+                "contains",
+                "not_contains",
+              ].includes(condition.operator) &&
+              !isUnaryOperator(condition.operator)
+            ) {
+              alertErrors.push(t("alerts.import.invalidQueryConditionOperator", { index }));
+            }
+            return;
+          }
+
+          // Check if it's a nested condition with 'and' or 'or' (V1 format)
+          if (condition.and || condition.or) {
+            const conditions = condition.and || condition.or;
+            if (!Array.isArray(conditions)) {
+              alertErrors.push(t("alerts.import.andOrConditionsArray", { index }));
+              return;
+            }
+            conditions.forEach(validateV1Condition);
+            return;
+          }
+
+          // If neither a simple condition nor a nested condition
+          alertErrors.push(t("alerts.import.invalidConditionFormat", { index }));
+        };
+
+        let conditionsToValidate = input.query_condition.conditions;
+
+        // Check if conditions is wrapped with version field (new format from backend)
+        if (conditionsToValidate.version !== undefined) {
+          // Wrapped format: { version: 2, conditions: {...} }
+          conditionsToValidate = conditionsToValidate.conditions;
+        }
+
+        // Determine format and validate accordingly
+        if (Array.isArray(conditionsToValidate)) {
+          // V0 format - flat array of conditions
+          conditionsToValidate.forEach((condition: any) => {
+            if (
+              !condition.column ||
+              !condition.operator ||
+              (condition.value === undefined && !isUnaryOperator(condition.operator))
+            ) {
+              alertErrors.push(t("alerts.import.queryConditionFieldsRequired", { index }));
+            }
+          });
+        } else if (conditionsToValidate.filterType === "group") {
+          // V2 format - new structure with filterType
+          validateV2Condition(conditionsToValidate);
+        } else if (conditionsToValidate.and || conditionsToValidate.or) {
+          // V1 format - nested conditions with and/or
+          validateV1Condition(conditionsToValidate);
+        } else {
+          // Unknown format
+          alertErrors.push(t("alerts.import.unrecognizedQueryConditionFormat", { index }));
+        }
+      }
+      // 7. Validate 'sql' and 'promql'
+      if (input.query_condition.type === "sql" && typeof input.query_condition.sql !== "string") {
+        alertErrors.push(t("alerts.import.sqlRequired", { index }));
+      }
+
+      if (
+        input.query_condition.type === "promql" &&
+        typeof input.query_condition.promql !== "string"
+      ) {
+        alertErrors.push(t("alerts.import.promqlRequired", { index }));
+      }
+
+      // 8. Validate 'vrl_function'
+      if (
+        input.query_condition.vrl_function &&
+        typeof input.query_condition.vrl_function !== "string"
+      ) {
+        alertErrors.push(t("alerts.import.vrlFunctionString", { index }));
+      }
+
+      // 9. Validate 'multi_time_range'
+      if (
+        input.query_condition.type === "custom" &&
+        input.query_condition.multi_time_range !== null &&
+        (!Array.isArray(input.query_condition.multi_time_range) ||
+          input.query_condition.multi_time_range.length > 0)
+      ) {
+        alertErrors.push(t("alerts.import.multiTimeRangeEmpty", { index }));
+      }
+
+      // 10. Validate 'trigger_condition'
+      const triggerCondition = input.trigger_condition;
+      if (!triggerCondition) {
+        alertErrors.push(t("alerts.import.triggerConditionRequired", { index }));
+      }
+      if (
+        isNaN(Number(triggerCondition.period)) ||
+        triggerCondition.period < 1 ||
+        typeof triggerCondition.period !== "number"
+      ) {
+        alertErrors.push(t("alerts.import.periodPositiveNumber", { index }));
+      }
+
+      const validOperators = ["=", "!=", ">=", "<=", ">", "<", "Contains", "NotContains"];
+      if (!validOperators.includes(triggerCondition.operator)) {
+        alertErrors.push(t("alerts.import.triggerOperatorInvalid", { index }));
+      }
+
+      if (
+        isNaN(Number(triggerCondition.frequency)) ||
+        triggerCondition.frequency < 1 ||
+        typeof triggerCondition.frequency !== "number"
+      ) {
+        alertErrors.push(t("alerts.import.frequencyPositiveNumber", { index }));
+      }
+
+      if (triggerCondition.cron && typeof triggerCondition.cron !== "string") {
+        alertErrors.push(t("alerts.import.cronExpressionString", { index }));
+      }
+
+      if (
+        isNaN(Number(triggerCondition.threshold)) ||
+        triggerCondition.threshold < 1 ||
+        typeof triggerCondition.threshold !== "number"
+      ) {
+        alertErrors.push(t("alerts.import.thresholdPositiveNumber", { index }));
+      }
+
+      if (
+        isNaN(Number(triggerCondition.silence)) ||
+        triggerCondition.silence < 0 ||
+        typeof triggerCondition.silence !== "number"
+      ) {
+        alertErrors.push(t("alerts.import.silenceNonNegativeNumber", { index }));
+      }
+
+      if (
+        (triggerCondition.frequency_type !== "minutes" &&
+          triggerCondition.frequency_type !== "cron") ||
+        typeof triggerCondition.frequency_type !== "string"
+      ) {
+        alertErrors.push(t("alerts.import.frequencyTypeInvalid", { index }));
+      }
+
+      if (
+        triggerCondition.frequency_type === "cron" &&
+        (triggerCondition.cron.trim() === "" || typeof triggerCondition.cron !== "string")
+      ) {
+        alertErrors.push(t("alerts.import.cronExpressionInvalid", { index }));
+      }
+
+      if (
+        !input.destinations ||
+        !Array.isArray(input.destinations) ||
+        input.destinations.length === 0
+      ) {
+        alertErrors.push({
+          message: t("alerts.import.destinationsRequired", { index }),
+          field: "destination_name",
+        });
+      }
+
+      if (typeof input.enabled !== "boolean") {
+        alertErrors.push(t("alerts.import.enabledBoolean", { index }));
+      }
+
+      if (input.tz_offset && (typeof input.tz_offset !== "number" || input.tz_offset < 0)) {
+        alertErrors.push(t("alerts.import.tzOffsetNumber", { index }));
+      }
+
+      if (
+        (input.trigger_condition.frequency_type == "cron" &&
+          !Object.prototype.hasOwnProperty.call(input.trigger_condition, "timezone")) ||
+        input.trigger_condition.timezone === ""
+      ) {
+        alertErrors.push({
+          message: t("alerts.import.timezoneRequiredForCron", { index }),
+          field: "timezone",
+        });
+      }
+
+      input.destinations.forEach((destination: any) => {
+        if (!checkDestinationInList(props.destinations, destination)) {
+          alertErrors.push({
+            message: t("alerts.import.destinationNotExist", { index, destination }),
+            field: "destination_name",
+          });
+        }
+      });
+
+      // This condition is added to avoid the error when the updated_at is not a number
+      if (typeof input.updated_at !== "number") {
+        input.updated_at = null;
+      }
+
+      // Log all alert errors at the end
+      if (alertErrors.length > 0) {
+        alertErrorsToDisplay.value.push(alertErrors);
+        return false;
+      }
+
+      return true;
+    };
+
+    const checkDestinationInList = (destinations: any, destinationName: any) => {
+      const destinationsList = destinations.map((destination: any) => destination.name);
+      return destinationsList.includes(destinationName);
+    };
+
+    const createAlert = async (input: any, index: any, folderId: any) => {
+      if (!Object.prototype.hasOwnProperty.call(input, "context_attributes")) {
+        input.context_attributes = {};
+      }
+      if (!Object.prototype.hasOwnProperty.call(input.trigger_condition, "timezone")) {
+        input.trigger_condition.timezone = store.state.timezone;
+      }
+      if (!Object.prototype.hasOwnProperty.call(input.trigger_condition, "tolerance_in_secs")) {
+        input.trigger_condition.tolerance_in_secs = null;
+      }
+      input.folder_id = folderId;
+      input.owner = store.state.userInfo.email;
+      input.last_edited_by = store.state.userInfo.email;
+      if (Object.prototype.hasOwnProperty.call(input, "id")) delete input.id;
+
+      // VERSION DETECTION AND CONVERSION
+      // Convert V0 and V1 conditions to V2 format before creating alert
+      if (input.query_condition && input.query_condition.conditions) {
+        let convertedConditions = input.query_condition.conditions;
+
+        // Check if it's already wrapped with version
+        if (convertedConditions.version === 2 || convertedConditions.version === "2") {
+          // Already wrapped, extract the inner conditions for detection
+          convertedConditions = convertedConditions.conditions;
+        }
+
+        const version = detectConditionsVersion(convertedConditions);
+
+        if (version === 0) {
+          // V0: Flat array format - convert to V2
+          convertedConditions = convertV0ToV2(convertedConditions);
+        } else if (version === 1) {
+          // V1: Tree-based format - convert to V2
+          if (convertedConditions.and || convertedConditions.or) {
+            // V1 Backend format
+            convertedConditions = convertV1BEToV2(convertedConditions);
+          } else if (convertedConditions.label && convertedConditions.items) {
+            // V1 Frontend format
+            convertedConditions = convertV1ToV2(convertedConditions);
+          }
+        }
+        // For version === 2, convertedConditions is already in correct format
+
+        // Backend expects: query_condition: { conditions: { version: 2, conditions: {...} } }
+        input.query_condition.conditions = {
+          version: 2,
+          conditions: ensureUnaryConditionValues(convertedConditions),
+        };
+      }
+
+      try {
+        await alertsService.create_by_alert_id(
+          store.state.selectedOrganization.identifier,
+          input,
+          folderId,
+        );
+
+        // Success
+        alertCreators.value.push({
+          message: t("alerts.import.createSuccess", { index, name: input.name }),
+          success: true,
+        });
+        // Emit update after each successful creation
+        emit("update:alerts", store, selectedFolderId.value);
+        getActiveFolderAlerts(selectedFolderId.value);
+        return true;
+      } catch (error: any) {
+        // Failure
+        alertCreators.value.push({
+          message: t("alerts.import.createFailed", {
+            index,
+            name: input.name,
+            reason: error?.response?.data?.message || t("alerts.import.unknownError"),
+          }),
+          success: false,
+        });
+        return false;
+      }
+    };
+
+    const updateStreams = async (streamType: string, index: number) => {
+      if (baseImportRef.value?.jsonArrayOfObj[index]) {
+        baseImportRef.value.jsonArrayOfObj[index].stream_type = streamType;
+        // Directly update jsonStr without triggering editor re-render
+        baseImportRef.value.jsonStr = JSON.stringify(baseImportRef.value.jsonArrayOfObj, null, 2);
+      }
+
+      try {
+        const streamResponse: any = await getStreams(streamType, false);
+        streamList.value = streamResponse.list.map((stream: any) => stream.name);
+      } catch (error) {
+        console.error("Error fetching streams:", error);
+      }
+    };
+
+    const filterDestinations = (val: string) => {
+      if (val === "") {
+        filteredDestinations.value = getFormattedDestinations.value;
+        return;
+      }
+      filteredDestinations.value = getFormattedDestinations.value.filter((destination: string) =>
+        destination.toLowerCase().includes(val.toLowerCase()),
+      );
+    };
+
+    const toggleDestination = (destination: string, index: number) => {
+      if (!userSelectedDestinations.value[index]) {
+        userSelectedDestinations.value[index] = [];
+      }
+
+      const destinations = userSelectedDestinations.value[index];
+      const destinationIndex = destinations.indexOf(destination);
+
+      if (destinationIndex === -1) {
+        destinations.push(destination);
+      } else {
+        destinations.splice(destinationIndex, 1);
+      }
+
+      updateUserSelectedDestinations(destinations, index);
+    };
+
+    const updateTimezone = (timezone: string, index: number) => {
+      if (baseImportRef.value?.jsonArrayOfObj[index]) {
+        if (!baseImportRef.value.jsonArrayOfObj[index].trigger_condition) {
+          baseImportRef.value.jsonArrayOfObj[index].trigger_condition = {};
+        }
+        baseImportRef.value.jsonArrayOfObj[index].trigger_condition.timezone = timezone;
+        // Directly update jsonStr without triggering editor re-render
+        baseImportRef.value.jsonStr = JSON.stringify(baseImportRef.value.jsonArrayOfObj, null, 2);
+      }
+    };
+
+    const timezoneFilterFn = (val: string) => {
+      if (val === "") {
+        filteredTimezone.value = timezoneOptions;
+        return;
+      }
+      const needle = val.toLowerCase();
+      filteredTimezone.value = timezoneOptions.filter((timezone: string) =>
+        timezone.toLowerCase().includes(needle),
+      );
+    };
+
+    const updateActiveFolderId = (newVal: any) => {
+      selectedFolderId.value = newVal.value;
+      getActiveFolderAlerts(selectedFolderId.value);
+    };
+
+    const getActiveFolderAlerts = async (folderId: string) => {
+      if (!store.state.organizationData.allAlertsListByNames[folderId]) {
+        const response: any = await alertsService.listByFolderId(
+          1,
+          1000,
+          "name",
+          false,
+          "",
+          store.state.selectedOrganization.identifier,
+          folderId,
+          "",
+        );
+
+        store.dispatch("setAllAlertsListByNames", {
+          ...store.state.organizationData.allAlertsListByNames,
+          [folderId]: response.data.list.map((alert: any) => alert.name),
+        });
+      }
+      activeFolderAlerts.value = store.state.organizationData.allAlertsListByNames[folderId];
+    };
+
+    const updateOrgId = (orgId: string, index: number) => {
+      if (baseImportRef.value?.jsonArrayOfObj[index]) {
+        baseImportRef.value.jsonArrayOfObj[index].org_id = orgId;
+        // Directly update jsonStr without triggering editor re-render
+        baseImportRef.value.jsonStr = JSON.stringify(baseImportRef.value.jsonArrayOfObj, null, 2);
+      }
+    };
+
+    // Additional helper functions for testing
+    const checkAlertsInList = (alerts: string[], alertName: string) => {
+      return alerts.includes(alertName);
+    };
+
+    const onSubmit = (event: any) => {
+      if (event?.preventDefault) {
+        event.preventDefault();
+      }
+    };
+
+    return {
+      t,
+      raw,
+      importJson,
+      router,
+      baseImportRef,
+      alertErrorsToDisplay,
+      templateErrorsToDisplay,
+      destinationErrorsToDisplay,
+      alertCreators,
+      destinationCreators,
+      userSelectedDestinations,
+      getFormattedDestinations,
+      jsonArrayOfObj,
+      streamList,
+      streams,
+      userSelectedStreamName,
+      updateStreamFields,
+      updateAlertName,
+      userSelectedAlertName,
+      streamTypes,
+      userSelectedStreamType,
+      updateStreams,
+      filterDestinations,
+      filteredDestinations,
+      updateUserSelectedDestinations,
+      toggleDestination,
+      userSelectedTimezone,
+      filteredTimezone,
+      timezoneSelectOptions,
+      updateTimezone,
+      timezoneFilterFn,
+      activeFolderId,
+      updateActiveFolderId,
+      selectedFolderId,
+      getActiveFolderAlerts,
+      activeFolderAlerts,
+      store,
+      isAlertImporting,
+      organizationDataList,
+      userSelectedOrgId,
+      updateOrgId,
+      // Exposed validation functions for testing
+      validateAlertInputs,
+      checkDestinationInList,
+      checkAlertsInList,
+      createAlert,
+      onSubmit,
+    };
+  },
+});
+</script>

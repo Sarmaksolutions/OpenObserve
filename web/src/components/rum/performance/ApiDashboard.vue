@@ -1,0 +1,326 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<!-- eslint-disable vue/v-on-event-hyphenation -->
+<!-- eslint-disable vue/attribute-hyphenation -->
+<template>
+  <div
+    data-test="api-performance-dashboards"
+    class="relative-position h-full"
+    :key="store.state.selectedOrganization.identifier"
+  >
+    <!-- Resolving the _rumdata schema before deciding which panels can run -->
+    <div
+      v-if="!schemaResolved"
+      data-test="api-dashboard-schema-loading"
+      class="flex h-[calc(100vh-15.625rem)] w-full items-center justify-center pb-4 text-center"
+    >
+      <div>
+        <OSpinner size="md" class="mx-auto block" />
+        <div class="w-full text-center">{{ t("rum.loadingDashboard") }}</div>
+      </div>
+    </div>
+
+    <!-- Stream has no network/resource data this view can render (e.g. a mobile app with
+         no network instrumentation) -->
+    <OEmptyState
+      v-else-if="showEmptyState"
+      data-test="api-dashboard-empty"
+      size="block"
+      illustration="pulse"
+      :hide-action="true"
+    >
+      <template #title>{{ t("rum.apiEmptyTitle") }}</template>
+      <template #description>{{ t("rum.apiEmptyDescription") }}</template>
+    </OEmptyState>
+
+    <template v-else>
+      <!-- eslint-disable local/no-hardcoded-px -- mixed with vh/vw — vh tracks the window while rem tracks font-size; keep the expression unit-consistent -->
+      <div
+        class="h-full max-h-[calc(100vh-196px)] min-h-0! overflow-y-auto"
+        :class="isLoading.length ? 'invisible' : 'visible'"
+      >
+        <!-- eslint-enable local/no-hardcoded-px -->
+        <div class="performance-dashboard">
+          <RenderDashboardCharts
+            ref="apiDashboardChartsRef"
+            :viewOnly="true"
+            :frame="false"
+            :dashboardData="dashboardData"
+            :currentTimeObj="dateTime"
+            searchType="RUM"
+            @variablesManagerReady="onVariablesManagerReady"
+          />
+        </div>
+      </div>
+      <div
+        v-show="isLoading.length"
+        class="absolute top-0 flex h-[calc(100vh-15.625rem)] w-full items-center justify-center pb-4 text-center"
+      >
+        <div>
+          <OSpinner size="md" class="mx-auto block" />
+          <div class="w-full text-center">{{ t("rum.loadingDashboard") }}</div>
+        </div>
+      </div>
+    </template>
+  </div>
+</template>
+
+<script lang="ts">
+// @ts-nocheck
+import { defineComponent, ref, watch, onMounted, onActivated, nextTick, type Ref } from "vue";
+import { useStore } from "vuex";
+import { useI18nTyped } from "@/types/i18n";
+import searchService from "@/services/search";
+import apiDashboard from "@/utils/rum/api.json";
+import RenderDashboardCharts from "@/views/Dashboards/RenderDashboardCharts.vue";
+import useRumPerformanceTab from "@/composables/rum/useRumPerformanceTab";
+import OSpinner from "@/lib/feedback/Spinner/OSpinner.vue";
+import OEmptyState from "@/lib/core/EmptyState/OEmptyState.vue";
+
+export default defineComponent({
+  name: "ApiDashboard",
+  components: {
+    RenderDashboardCharts,
+    OSpinner,
+    OEmptyState,
+  },
+  props: {
+    dateTime: {
+      type: Object,
+      default: () => ({}),
+    },
+    selectedDate: {
+      type: Object,
+      default: () => ({}),
+    },
+  },
+  emits: ["variablesManagerReady"],
+  setup(props, { emit }) {
+    const { t } = useI18nTyped();
+    const store = useStore();
+
+    // Adaptive dashboard: drops resource/network panels the stream can't serve, reflowing
+    // the survivors. See docs/designs/MOBILE_RUM_ADAPTIVE_UI_DESIGN.md.
+    const { dashboardData, schemaResolved, showEmptyState, ensureRumSchema } =
+      useRumPerformanceTab(apiDashboard);
+
+    const showDashboardSettingsDialog = ref(false);
+    const apiDashboardChartsRef: Ref<any> = ref(null);
+    const viewOnly = ref(true);
+    const eventLog = ref([]);
+    const topSlowResources = ref([]);
+    const topHeavyResources = ref([]);
+    const topErrorResources = ref([]);
+    const variablesData = ref({ isVariablesLoading: true, values: [] });
+
+    const refDateTime: any = ref(null);
+    const refreshInterval = ref(0);
+    const topCount = 10;
+    const isLoading: Ref<boolean[]> = ref([]);
+
+    // Variables manager event handler - pass through to parent
+    const onVariablesManagerReady = (manager: any) => {
+      emit("variablesManagerReady", manager);
+    };
+
+    onMounted(() => {
+      ensureRumSchema();
+      updateLayout();
+    });
+
+    onActivated(() => {
+      updateLayout();
+    });
+
+    const updateLayout = async () => {
+      await nextTick();
+      await nextTick();
+      await nextTick();
+      await nextTick();
+      // emit window resize event to trigger the layout
+      window.dispatchEvent(new Event("resize"));
+    };
+
+    const getTopSlowResources = () => {
+      topSlowResources.value = [];
+
+      let whereClause = `where resource_duration>=0 and resource_method is not null`;
+      const variablesString = getVariablesString();
+      if (variablesString && variablesString.length) {
+        whereClause += ` ${variablesString}`;
+      }
+
+      const req = {
+        query: {
+          sql: `SELECT avg(resource_duration/1000000) as max_duration, SPLIT_PART(resource_url, '?', 1) AS url FROM "_rumdata" ${whereClause} group by url order by max_duration desc`,
+          start_time: props.selectedDate.startTime,
+          end_time: props.selectedDate.endTime,
+          from: 0,
+          size: 10,
+        },
+      };
+
+      searchService
+        .search(
+          {
+            org_identifier: store.state.selectedOrganization.identifier,
+            query: req,
+            page_type: "logs",
+          },
+          "RUM",
+        )
+        .then((res) => {
+          res.data.hits.slice(0, topCount).forEach((element: any) => {
+            topSlowResources.value.push({
+              url: new URL(element.url).pathname,
+              max_duration: element.max_duration.toFixed(2),
+            });
+          });
+        });
+    };
+
+    const getTopHeavyResources = () => {
+      topHeavyResources.value = [];
+
+      let whereClause = `WHERE resource_size>=0`;
+      const variablesString = getVariablesString();
+      if (variablesString && variablesString.length) {
+        whereClause += ` ${variablesString}`;
+      }
+
+      const req = {
+        query: {
+          sql: `SELECT avg(resource_size/1024) as max_resource_size, SPLIT_PART(resource_url, '?', 1) AS url FROM "_rumdata" ${whereClause} group by url order by max_resource_size desc`,
+          start_time: props.selectedDate.startTime,
+          end_time: props.selectedDate.endTime,
+          from: 0,
+          size: topCount,
+        },
+      };
+
+      searchService
+        .search(
+          {
+            org_identifier: store.state.selectedOrganization.identifier,
+            query: req,
+            page_type: "logs",
+          },
+          "RUM",
+        )
+        .then((res) => {
+          res.data.hits.forEach((element: any) => {
+            topHeavyResources.value.push({
+              ...element,
+              url: new URL(element.url).pathname,
+            });
+          });
+        });
+    };
+
+    const getTopErrorResources = () => {
+      topErrorResources.value = [];
+
+      let whereClause = `WHERE resource_status_code>400`;
+      const variablesString = getVariablesString();
+      if (variablesString && variablesString.length) {
+        whereClause += ` ${variablesString}`;
+      }
+
+      const req = {
+        query: {
+          sql: `SELECT SPLIT_PART(resource_url, '?', 1) AS url, count(*) as error_count FROM "_rumdata" ${whereClause}  group by url order by error_count desc`,
+          start_time: props.selectedDate.startTime,
+          end_time: props.selectedDate.endTime,
+          from: 0,
+          size: topCount,
+        },
+      };
+
+      searchService
+        .search(
+          {
+            org_identifier: store.state.selectedOrganization.identifier,
+            query: req,
+            page_type: "logs",
+          },
+          "RUM",
+        )
+        .then((res) => {
+          res.data.hits.forEach((element: any) => {
+            topErrorResources.value.push({
+              ...element,
+              url: new URL(element.url).pathname,
+            });
+          });
+        });
+    };
+
+    const getVariablesString = () => {
+      let variablesString = "";
+      variablesData.value?.values?.length &&
+        variablesData.value.values.forEach((element: any) => {
+          if (element.type === "query_values" && !!element.value) {
+            variablesString += ` and ${element.name}='${element.value}'`;
+          }
+        });
+
+      return variablesString;
+    };
+
+    const addSettingsData = () => {
+      showDashboardSettingsDialog.value = true;
+    };
+
+    watch(
+      () => props.selectedDate,
+      (newVal, oldValue) => {
+        if (JSON.stringify(newVal) !== JSON.stringify(oldValue)) {
+          getTopHeavyResources();
+          getTopSlowResources();
+        }
+      },
+    );
+
+    return {
+      dashboardData,
+      schemaResolved,
+      showEmptyState,
+      t,
+      store,
+      refDateTime,
+      refreshInterval,
+      viewOnly,
+      eventLog,
+      variablesData,
+      onVariablesManagerReady,
+      addSettingsData,
+      showDashboardSettingsDialog,
+      apiDashboard,
+      isLoading,
+      apiDashboardChartsRef,
+      updateLayout,
+      getTopSlowResources,
+      getTopHeavyResources,
+      getTopErrorResources,
+      getVariablesString,
+      topSlowResources,
+      topHeavyResources,
+      topErrorResources,
+    };
+  },
+});
+</script>

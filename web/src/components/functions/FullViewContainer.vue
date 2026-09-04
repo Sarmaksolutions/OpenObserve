@@ -1,0 +1,80 @@
+<template>
+  <div class="bg-section-header-bg py-0.5">
+    <div
+      class="flex justify-between"
+      :class="{ 'items-center': minHeaderHeight }"
+      :style="minHeaderHeight ? { minHeight: minHeaderHeight } : undefined"
+    >
+      <div class="flex items-center">
+        <OIcon
+          v-if="showExpandIcon"
+          name="keyboard-arrow-up"
+          @click.stop="expanded = !expanded"
+          class="text-text-secondary me-1 cursor-pointer transition-all"
+          :class="expanded ? 'rotate-180 transform' : ''"
+          size="md"
+        />
+        <div
+          @click="showExpandIcon ? (expanded = !expanded) : null"
+          class="text-text-secondary text-sm font-bold"
+          :class="labelClass"
+        >
+          {{ label }}
+        </div>
+        <slot name="left" />
+      </div>
+      <div>
+        <slot name="right" />
+      </div>
+    </div>
+    <slot v-if="expanded" />
+  </div>
+</template>
+<script setup lang="ts">
+import { type I18nText } from "@/types/i18n";
+import { computed, type PropType } from "vue";
+import OIcon from "@/lib/core/Icon/OIcon.vue";
+
+const props = defineProps({
+  name: {
+    type: String,
+    required: true,
+  },
+  label: {
+    type: String as unknown as PropType<I18nText>,
+    required: true,
+  },
+  isExpandable: {
+    type: Boolean,
+    default: true,
+  },
+  isExpanded: {
+    type: Boolean,
+    default: false,
+  },
+  labelClass: {
+    type: String,
+    default: "",
+  },
+  showExpandIcon: {
+    type: Boolean,
+    default: true,
+    required: false,
+  },
+  // Optional fixed header-row height (e.g. "2.125rem"). When set, the title row is
+  // given this min-height and its content is vertically centered — used to keep
+  // a header bar visually aligned with sibling headers that contain taller
+  // controls (e.g. a "Run query" button). Empty = natural content height.
+  minHeaderHeight: {
+    type: String,
+    default: "",
+  },
+});
+
+const emits = defineEmits(["update:isExpanded"]);
+
+const expanded = computed({
+  get: () => props.isExpanded,
+  set: (value) => emits("update:isExpanded", value),
+});
+</script>

@@ -1,0 +1,140 @@
+// Copyright 2026 OpenObserve Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+import { raw } from "@/types/i18n";
+
+import { PrebuiltConfig, PrebuiltType } from "./types";
+
+export const isValidSlackWebhookUrl = (url: string): boolean => {
+  if (url !== url.trim() || /\s/.test(url) || url.includes("?") || url.includes("#")) {
+    return false;
+  }
+
+  try {
+    const parsed = new URL(url);
+    const validHost =
+      parsed.hostname === "hooks.slack.com" || parsed.hostname === "hooks.slack-gov.com";
+
+    return (
+      parsed.protocol === "https:" &&
+      validHost &&
+      parsed.username === "" &&
+      parsed.password === "" &&
+      parsed.port === "" &&
+      parsed.search === "" &&
+      parsed.hash === "" &&
+      /^\/services\/[^/]+\/[^/]+\/[^/]+\/?$/.test(parsed.pathname)
+    );
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Slack prebuilt destination configuration
+ * Provides predefined configuration for Slack webhook notifications
+ * Note: Template body is managed by the backend; this is just a fallback/reference.
+ */
+const slackTemplateBody = JSON.stringify(
+  {
+    text: "🚨 *Alert: {alert_name}*",
+    blocks: [
+      {
+        type: "header",
+        text: {
+          type: "plain_text",
+          text: "🚨 {alert_name}",
+        },
+      },
+      {
+        type: "section",
+        fields: [
+          { type: "mrkdwn", text: "*Stream:*\n{stream_name}" },
+          { type: "mrkdwn", text: "*Type:*\n{stream_type}" },
+          { type: "mrkdwn", text: "*Status:*\n🔴 Firing" },
+          { type: "mrkdwn", text: "*Count:*\n{alert_count}" },
+        ],
+      },
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: "*Threshold Exceeded:* {alert_operator} {alert_threshold}",
+        },
+      },
+      {
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            text: { type: "plain_text", text: "View in OpenObserve" },
+            url: "{alert_url}",
+          },
+        ],
+      },
+    ],
+  },
+  null,
+  2,
+);
+
+export const slackTemplate = {
+  name: "prebuilt_slack",
+  body: slackTemplateBody,
+  type: "http" as const,
+  isDefault: false,
+};
+
+export const slackConfig: PrebuiltConfig = {
+  templateName: "prebuilt_slack",
+  templateBody: slackTemplateBody,
+  headers: {
+    "Content-Type": "application/json",
+  },
+  method: "post",
+  urlValidator: isValidSlackWebhookUrl,
+  credentialFields: [
+    {
+      key: "webhookUrl",
+      labelKey: "alerts.prebuiltDestinations.slackWebhookUrl",
+      type: "text",
+      required: true,
+      hintKey: "alerts.prebuiltDestinations.slackWebhookUrlHelp",
+      validator: (url: string) => {
+        const invalid = { key: "alerts.prebuiltDestinations.invalidSlackWebhookUrl" };
+        return isValidSlackWebhookUrl(url) || invalid;
+      },
+    },
+    {
+      key: "channel",
+      labelKey: "alerts.prebuiltDestinations.slackChannel",
+      type: "text",
+      required: false,
+      hintKey: "alerts.prebuiltDestinations.slackChannelHelp",
+      persistInMetadata: true,
+    },
+  ],
+};
+
+import slackLogo from "@/assets/images/alerts/destinations/slack.png";
+
+export const slackDestinationType: PrebuiltType = {
+  id: "slack",
+  name: raw("Slack"),
+  descriptionKey: "alert_destinations.prebuilt.slackDescription",
+  icon: "slack",
+  image: slackLogo,
+  popular: true,
+  category: "messaging",
+};

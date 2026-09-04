@@ -1,0 +1,87 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+-->
+
+<!--
+LogsHighLighting Component
+===============================
+A Vue component that intelligently colorizes JSON data and log lines with syntax highlighting and keyword highlighting.
+
+Features:
+- Colorizes JSON objects with different colors for keys, values, and structural elements
+- Detects and highlights semantic types in log lines (IPs, URLs, timestamps, etc.)
+- Highlights matching keywords from query strings with yellow background
+- Theme-aware coloring that adapts to light/dark modes
+- Handles primitive values (strings, numbers, booleans, null)
+- Smart tokenization that preserves quoted strings and bracketed content
+
+Usage Examples:
+- <LogsHighLighting :data="{name: 'John', age: 25}" />  // JSON object
+- <LogsHighLighting :data="'192.168.1.1'" :query-string="match_all('192')" />  // IP with highlighting
+- <LogsHighLighting :data="false" />  // Boolean value
+- <LogsHighLighting :data="1234567890123" />  // Timestamp-like number
+-->
+<template>
+  <span
+    class="logs-highlight-json inline font-mono text-xs wrap-break-word"
+    v-html="colorizedJson"
+  ></span>
+</template>
+
+<script setup lang="ts">
+// withDefaults is a compiler macro; importing it conflicts with the macro declaration
+import { computed } from "vue";
+import { useTheme } from "@/composables/useTheme";
+import { useLogsHighlighter } from "@/composables/useLogsHighlighter";
+import { useI18nTyped } from "@/types/i18n";
+
+/**
+ * Component Props Interface
+ */
+export interface Props {
+  data: any;
+  showBraces?: boolean;
+  showQuotes?: boolean;
+  queryString?: string;
+  simpleMode?: boolean; // Only highlighting, no semantic colorization
+}
+
+const props = withDefaults(defineProps<Props>(), {
+  showBraces: true,
+  showQuotes: false,
+  queryString: "",
+  simpleMode: false,
+});
+
+const { isDark } = useTheme();
+const { t } = useI18nTyped();
+const { colorizeJson } = useLogsHighlighter(t);
+
+/**
+ * Main colorization logic with integrated highlighting
+ * Uses the composable to avoid code duplication
+ */
+const colorizedJson = computed((): string => {
+  return colorizeJson(
+    props.data,
+    isDark.value,
+    props.showBraces,
+    props.showQuotes,
+    props.queryString,
+    props.simpleMode,
+  );
+});
+</script>

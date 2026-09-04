@@ -1,0 +1,871 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <OPageLayout
+    data-test="alert-history-page"
+    :title="t('alerts.history')"
+    title-data-test="alerts-history-title"
+    :back="{ label: t('alerts.header'), onClick: goBack, dataTest: 'alert-history-back-btn' }"
+    bleed
+  >
+    <template #actions>
+      <DateTime
+        ref="dateTimeRef"
+        auto-apply
+        :default-type="dateTimeType"
+        :default-absolute-time="{
+          startTime: absoluteTime.startTime,
+          endTime: absoluteTime.endTime,
+        }"
+        :default-relative-time="relativeTime"
+        data-test="alert-history-date-picker"
+        @on:date-change="updateDateTime"
+      />
+      <OSelect
+        v-model="selectedAlert"
+        :options="filteredAlertOptions"
+        labelKey="label"
+        valueKey="value"
+        @update:model-value="onAlertSelected"
+        :placeholder="t('alerts.searcHistory')"
+        data-test="alert-history-search-select"
+        class="o2-search-input min-w-62.5"
+        clearable
+        @clear="clearSearch"
+      >
+        <template #icon-left>
+          <OIcon class="o2-search-input-icon" name="search" size="sm" />
+        </template>
+        <template #empty>
+          <div class="text-muted-foreground px-3 py-2">
+            {{ t("alerts.noAlertsFound") }}
+          </div>
+        </template>
+      </OSelect>
+      <OButton
+        variant="ghost"
+        icon-left="search"
+        size="icon-sm"
+        @click="manualSearch"
+        data-test="alert-history-manual-search-btn"
+        :disabled="loading"
+      >
+        <OTooltip :content="t('common.search')" />
+      </OButton>
+      <OButton
+        variant="ghost"
+        size="icon-sm"
+        icon-left="refresh"
+        @click="refreshData"
+        data-test="alert-history-refresh-btn"
+        :loading="loading"
+      >
+        <OTooltip :content="t('common.refresh')" />
+      </OButton>
+    </template>
+    <div class="min-h-0 flex-1 overflow-hidden">
+      <div class="bg-card-glass-bg h-full">
+        <!-- eslint-disable local/no-hardcoded-px -- mixed with vh/vw — vh tracks the window while rem tracks font-size; keep the expression unit-consistent -->
+        <OTable
+          data-test="alert-history-table"
+          :data="rows"
+          :columns="columns"
+          row-key="id"
+          pagination="server"
+          :current-page="currentPage"
+          :page-size="pageSize"
+          :page-size-options="pageSizeOptions"
+          :total-count="totalCount"
+          sorting="server"
+          :sort-by="sortBy"
+          :sort-order="sortOrder"
+          :loading="loading"
+          show-index
+          :show-global-filter="false"
+          :default-columns="false"
+          width="100%"
+          max-height="calc(100vh - 130px)"
+          @pagination-change="onPaginationChange"
+          @sort-change="onSortChange"
+        >
+          <!-- eslint-enable local/no-hardcoded-px -->
+          <template #empty>
+            <div class="h-screen w-full">
+              <NoData />
+            </div>
+          </template>
+
+          <template #cell-timestamp="{ value }">
+            <OTimeCell
+              :value="value"
+              unit="us"
+              mode="absolute"
+              :timezone="store.state.timezone"
+              :empty-label="raw('—')"
+            />
+          </template>
+
+          <template #cell-start_time="{ value }">
+            <OTimeCell
+              :value="value"
+              unit="us"
+              mode="absolute"
+              :timezone="store.state.timezone"
+              :empty-label="raw('—')"
+            />
+          </template>
+
+          <template #cell-end_time="{ value }">
+            <OTimeCell
+              :value="value"
+              unit="us"
+              mode="absolute"
+              :timezone="store.state.timezone"
+              :empty-label="raw('—')"
+            />
+          </template>
+
+          <template #cell-status="{ value }">
+            <OTag type="alertState" :value="value" data-test="alert-history-status-badge" />
+          </template>
+
+          <!-- T-10: what was observed, against what, and the level it
+               classified to. Pre-change rows (no actual_value) render "—". -->
+          <template #cell-condition="{ row }">
+            <div class="flex min-w-0 items-center gap-1.5">
+              <span class="text-compact whitespace-nowrap tabular-nums">
+                {{ conditionSummary(row) }}
+              </span>
+              <template v-if="row.level">
+                <span class="text-text-secondary text-2xs shrink-0">→</span>
+                <OTag type="alertLevel" :value="row.level" class="shrink-0" />
+              </template>
+              <span
+                v-if="row.group_label"
+                class="text-2xs text-text-secondary min-w-0 truncate"
+                data-test="alert-history-group-label"
+              >
+                {{ t("alerts.historyTable.forGroup", { group: row.group_label }) }}
+                <OTooltip :content="row.group_label" :max-width="'18.75rem'" />
+              </span>
+            </div>
+          </template>
+
+          <template #cell-is_realtime="{ value }">
+            <OIcon
+              :name="value ? 'check-circle' : 'schedule'"
+              :class="value ? 'text-status-positive' : 'text-text-body'"
+              size="xs"
+            >
+              <OTooltip :content="value ? t('common.realTime') : t('alerts.scheduled')" />
+            </OIcon>
+          </template>
+
+          <template #cell-is_silenced="{ value }">
+            <OIcon
+              :name="value ? 'volume-off' : 'volume-up'"
+              :class="value ? 'text-text-body' : 'text-status-positive'"
+              size="md"
+            >
+              <OTooltip
+                :content="value ? t('alerts.insights.filters.silenced') : t('common.notSilenced')"
+              />
+            </OIcon>
+          </template>
+
+          <template #cell-duration="{ row }">
+            {{ formatDuration(row.end_time - row.start_time) }}
+          </template>
+
+          <template #cell-dedup="{ row }">
+            <span v-if="!row.dedup_enabled" class="text-text-secondary">-</span>
+            <div v-else-if="row.dedup_suppressed" class="text-status-error-text">
+              <OIcon name="block" size="sm">
+                <OTooltip>
+                  <template #content>
+                    {{ t("alerts.suppressedByDeduplication") }}
+                    <div v-if="row.dedup_count">
+                      {{ t("alerts.occurrence", { count: row.dedup_count }, row.dedup_count) }}
+                    </div>
+                  </template>
+                </OTooltip>
+              </OIcon>
+            </div>
+            <div v-else-if="row.grouped" class="text-primary flex items-center justify-center">
+              <OIcon name="group-work" size="md">
+                <OTooltip>
+                  <template #content>
+                    {{ t("alerts.groupedNotification") }}
+                    <div>{{ row.group_size }} {{ t("alerts.alertsBatchedTogether") }}</div>
+                  </template>
+                </OTooltip>
+              </OIcon>
+              <span class="ms-1 text-xs">×{{ row.group_size || 1 }}</span>
+            </div>
+            <div v-else class="text-status-positive flex items-center justify-center">
+              <OIcon name="check-circle" size="md">
+                <OTooltip>
+                  <template #content>
+                    {{ t("alerts.notificationSent") }}
+                    <div v-if="row.dedup_count && row.dedup_count > 1">
+                      {{ row.dedup_count }} {{ t("alerts.occurrencesDeduplicated") }}
+                    </div>
+                  </template>
+                </OTooltip>
+              </OIcon>
+              <span v-if="row.dedup_count && row.dedup_count > 1" class="ms-1 text-xs">
+                ×{{ row.dedup_count }}
+              </span>
+            </div>
+          </template>
+
+          <template #cell-actions="{ row }">
+            <OButton
+              variant="ghost"
+              size="icon-sm"
+              icon-left="visibility"
+              @click="showDetailsDialog(row)"
+              data-test="alert-history-view-details"
+            >
+              <OTooltip :content="t('alerts.viewDetails')" />
+            </OButton>
+            <OButton
+              v-if="row.error"
+              :data-test="`pipeline-list-${row.name}-error-indicator`"
+              variant="ghost-destructive"
+              size="icon-sm"
+              icon-left="error"
+              @click.stop="showErrorDialog(row)"
+            >
+              <OTooltip
+                :content="
+                  t('common.lastErrorAt', { time: new Date(row.timestamp / 1000).toLocaleString() })
+                "
+              />
+            </OButton>
+          </template>
+        </OTable>
+      </div>
+    </div>
+
+    <!-- Details Dialog -->
+    <ODialog
+      data-test="alert-history-details-dialog"
+      v-model:open="detailsDialog"
+      :width="55"
+      :title="t('alerts.alertExecutionDetails')"
+      :primary-button-label="t('common.close')"
+      @click:primary="detailsDialog = false"
+    >
+      <div v-if="selectedRow" class="gap-2">
+        <!-- Basic Information -->
+        <div class="px-0 py-1">
+          <div class="flex gap-3">
+            <div class="w-1/2">
+              <div class="text-text-secondary mb-1 text-xs">{{ t("alerts.alertName") }}</div>
+              <div class="text-sm font-medium">
+                {{ selectedRow.alert_name }}
+              </div>
+            </div>
+            <div class="w-1/2">
+              <div class="text-text-secondary mb-1 text-xs">{{ t("common.status") }}</div>
+              <OTag type="alertState" :value="selectedRow.status" />
+            </div>
+          </div>
+        </div>
+
+        <OSeparator class="my-2" />
+
+        <!-- Time Information -->
+        <div class="px-0 py-1">
+          <div class="flex gap-3">
+            <div class="w-1/2">
+              <div class="text-text-secondary mb-1 text-xs">{{ t("alerts.timestamp") }}</div>
+              <div class="text-sm">
+                {{ formatHistoryDate(selectedRow.timestamp) }}
+              </div>
+            </div>
+            <div class="w-1/2">
+              <div class="text-text-secondary mb-1 text-xs">{{ t("common.duration") }}</div>
+              <div class="text-sm">
+                {{ formatDuration(selectedRow.end_time - selectedRow.start_time) }}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <OSeparator class="my-2" />
+
+        <!-- Alert Configuration -->
+        <div class="px-0 py-1">
+          <div class="flex gap-3">
+            <div class="w-1/2">
+              <div class="text-text-secondary mb-1 text-xs">{{ t("common.type") }}</div>
+              <div class="text-sm">
+                <OIcon
+                  :name="selectedRow.is_realtime ? 'speed' : 'schedule'"
+                  class="me-1"
+                  size="xs"
+                />
+                {{ selectedRow.is_realtime ? t("common.realTime") : t("alerts.scheduled") }}
+              </div>
+            </div>
+            <div class="w-1/2">
+              <div class="text-text-secondary mb-1 text-xs">
+                {{ t("alerts.insights.filters.silenced") }}
+              </div>
+              <div class="text-sm">
+                <OIcon v-if="selectedRow.is_silenced" name="volume-off" size="xs" class="me-1" />
+                <OIcon v-else name="volume-up" size="xs" class="me-1" />
+                {{ selectedRow.is_silenced ? t("common.yes") : t("common.no") }}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Performance Metrics (if available) -->
+        <template
+          v-if="
+            selectedRow.evaluation_took_in_secs || selectedRow.query_took || selectedRow.retries > 0
+          "
+        >
+          <OSeparator class="my-2" />
+          <div class="px-0 py-1">
+            <div class="flex gap-3">
+              <div v-if="selectedRow.evaluation_took_in_secs" class="w-1/3">
+                <div class="text-text-secondary mb-1 text-xs">
+                  {{ t("alerts.evaluationTime") }}
+                </div>
+                <div class="text-sm">{{ selectedRow.evaluation_took_in_secs.toFixed(2) }}s</div>
+              </div>
+              <div v-if="selectedRow.query_took" class="w-1/3">
+                <div class="text-text-secondary mb-1 text-xs">
+                  {{ t("alerts.queryTime") }}
+                </div>
+                <div class="text-sm">{{ (selectedRow.query_took / 1000).toFixed(2) }}ms</div>
+              </div>
+              <div v-if="selectedRow.retries > 0" class="w-1/3">
+                <div class="text-text-secondary mb-1 text-xs">{{ t("alerts.retries") }}</div>
+                <div class="text-sm">{{ selectedRow.retries }}</div>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <!-- Source Node (if available) -->
+        <template v-if="selectedRow.source_node">
+          <OSeparator class="my-2" />
+          <div class="px-0 py-1">
+            <div class="text-text-secondary mb-1 text-xs">{{ t("alerts.sourceNode") }}</div>
+            <div class="font-mono text-sm">
+              {{ selectedRow.source_node }}
+            </div>
+          </div>
+        </template>
+
+        <!-- Error Details (if available) -->
+        <template v-if="selectedRow.error">
+          <OSeparator class="my-2" />
+          <div class="px-0 py-1">
+            <div class="text-text-secondary mb-1 text-xs">
+              <OIcon name="error" size="xs" class="me-1" />
+              {{ t("alerts.errorDetails") }}
+            </div>
+            <div
+              class="rounded-default border-negative/30 bg-status-error-bg mt-2 border border-solid p-2"
+            >
+              <pre
+                class="text-sm"
+                style="
+                  white-space: pre-wrap;
+                  word-break: break-word;
+                  margin: 0;
+                  font-family: var(--font-mono);
+                  font-size: var(--text-xs);
+                "
+                >{{ selectedRow.error }}</pre>
+            </div>
+          </div>
+        </template>
+
+        <!-- Success Response (if available) -->
+        <template v-if="selectedRow.success_response">
+          <OSeparator class="my-2" />
+          <div class="px-0 py-1">
+            <div class="text-text-secondary mb-1 text-xs">
+              <OIcon name="check-circle" size="xs" class="me-1" />
+              {{ t("alerts.response") }}
+            </div>
+            <div
+              class="rounded-default border-positive/30 bg-status-success-bg mt-2 border border-solid p-2"
+            >
+              <pre
+                class="text-sm"
+                style="
+                  white-space: pre-wrap;
+                  word-break: break-word;
+                  margin: 0;
+                  font-family: var(--font-mono);
+                  font-size: var(--text-xs);
+                "
+                >{{ selectedRow.success_response }}</pre>
+            </div>
+          </div>
+        </template>
+      </div>
+    </ODialog>
+
+    <!-- Error Dialog -->
+    <ODialog
+      data-test="alert-history-error-dialog"
+      v-model:open="errorDialog"
+      size="md"
+      :title="errorMessage.alert_name"
+      :primary-button-label="t('common.close')"
+      @click:primary="closeErrorDialog"
+    >
+      <template #header-left>
+        <OIcon name="error" size="sm" class="text-status-error-text" />
+      </template>
+      <template #header-right>
+        <div class="text-compact ms-9 flex items-center text-xs opacity-70">
+          <span class="me-1">{{ t("alerts.lastError") }}</span>
+          <OIcon name="schedule" size="xs" class="me-1" />
+          {{
+            errorMessage.last_error_timestamp &&
+            new Date(errorMessage.last_error_timestamp / 1000).toLocaleString()
+          }}
+        </div>
+      </template>
+
+      <div class="mb-4">
+        <div class="mb-2 text-sm font-semibold tracking-[0.02em] opacity-80">
+          {{ t("alerts.errorSummary") }}
+        </div>
+        <div
+          class="rounded-default text-compact bg-status-error-bg border-status-negative text-status-error-text border border-solid p-4 font-mono leading-[1.6] wrap-break-word whitespace-pre-wrap"
+        >
+          {{ errorMessage.error }}
+        </div>
+      </div>
+    </ODialog>
+  </OPageLayout>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted, watch } from "vue";
+import { useRouter } from "vue-router";
+import { useStore } from "vuex";
+import { raw, useI18nTyped } from "@/types/i18n";
+import { formatDate } from "@/utils/date";
+import DateTime from "@/components/DateTime.vue";
+import OTable from "@/lib/core/Table/OTable.vue";
+import OTimeCell from "@/lib/core/Table/cells/OTimeCell.vue";
+import type { OTableColumnDef } from "@/lib/core/Table/OTable.types";
+import alertsService from "@/services/alerts";
+import NoData from "@/components/shared/grid/NoData.vue";
+import OPageLayout from "@/lib/core/PageLayout/OPageLayout.vue";
+import OIcon from "@/lib/core/Icon/OIcon.vue";
+import OTag from "@/lib/core/Badge/OTag.vue";
+import { conditionSummary } from "@/utils/alerts/runOutcome";
+import OButton from "@/lib/core/Button/OButton.vue";
+import ODialog from "@/lib/overlay/Dialog/ODialog.vue";
+import OSelect from "@/lib/forms/Select/OSelect.vue";
+import OTooltip from "@/lib/overlay/Tooltip/OTooltip.vue";
+import { toast } from "@/lib/feedback/Toast/useToast";
+import OSeparator from "@/lib/core/Separator/OSeparator.vue";
+import { COL } from "@/lib/core/Table/OTable.types";
+
+const { t } = useI18nTyped();
+const store = useStore();
+const router = useRouter();
+
+// Data
+const loading = ref(false);
+const rows = ref<any[]>([]);
+const searchQuery = ref("");
+const selectedAlert = ref<any>(null);
+const allAlerts = ref<any[]>([]);
+const filteredAlertOptions = ref<any[]>([]);
+const currentPage = ref(1);
+const pageSize = ref(20);
+const totalCount = ref(0);
+const sortBy = ref("timestamp");
+const sortOrder = ref<"asc" | "desc">("desc");
+
+const pageSizeOptions = [10, 20, 50, 100];
+
+// Date time - default to last 15 minutes (relative)
+const dateTimeRef = ref<any>(null);
+const dateTimeType = ref("relative");
+const relativeTime = ref("15m");
+const now = Date.now();
+const fifteenMinutesAgo = now - 15 * 60 * 1000;
+const absoluteTime = ref({
+  startTime: fifteenMinutesAgo * 1000, // Convert to microseconds
+  endTime: now * 1000, // Convert to microseconds
+});
+
+// Internal datetime values for API calls
+const dateTimeValues = ref({
+  startTime: fifteenMinutesAgo * 1000,
+  endTime: now * 1000,
+  type: "relative",
+  relativeTimePeriod: "15m",
+});
+
+// Dialogs
+const detailsDialog = ref(false);
+const errorDialog = ref(false);
+const selectedRow = ref<any>(null);
+// Holds the clicked history row (or ""/null when cleared) — see showErrorDialog.
+const errorMessage = ref<any>("");
+
+// Table columns
+const columns = ref<OTableColumnDef[]>([
+  {
+    id: "alert_name",
+    header: t("alerts.alertName"),
+    accessorKey: "alert_name",
+    sortable: true,
+    size: COL.name,
+    meta: { align: "left", autoWidth: true },
+  },
+  {
+    id: "is_realtime",
+    header: t("alerts.type"),
+    accessorKey: "is_realtime",
+    sortable: true,
+    size: 37,
+    minSize: 37,
+    maxSize: 37,
+    cell: " ",
+    meta: { align: "left" },
+  },
+  {
+    id: "is_silenced",
+    header: t("alerts.isSilenced"),
+    accessorKey: "is_silenced",
+    sortable: true,
+    size: 37,
+    minSize: 37,
+    maxSize: 37,
+    cell: " ",
+    meta: { align: "left" },
+  },
+  {
+    id: "timestamp",
+    header: t("alerts.timestamp"),
+    accessorKey: "timestamp",
+    sortable: true,
+    size: COL.dateAbsolute,
+    maxSize: COL.dateAbsolute,
+    cell: " ",
+    meta: { align: "left" },
+  },
+  {
+    id: "start_time",
+    header: t("alerts.startTime"),
+    accessorKey: "start_time",
+    sortable: true,
+    size: COL.dateAbsolute,
+    maxSize: COL.dateAbsolute,
+    cell: " ",
+    meta: { align: "left" },
+  },
+  {
+    id: "end_time",
+    header: t("alerts.endTime"),
+    accessorKey: "end_time",
+    sortable: true,
+    size: COL.dateAbsolute,
+    maxSize: COL.dateAbsolute,
+    cell: " ",
+    meta: { align: "left" },
+  },
+  {
+    id: "duration",
+    header: t("alerts.duration"),
+    accessorFn: (row: any) => row.end_time - row.start_time,
+    sortable: false,
+    size: COL.duration,
+    maxSize: COL.duration,
+    cell: " ",
+    meta: { align: "right" },
+  },
+  {
+    id: "status",
+    header: t("alerts.status"),
+    accessorKey: "status",
+    sortable: true,
+    size: COL.status,
+    maxSize: COL.status,
+    cell: " ",
+    meta: { align: "left" },
+  },
+  {
+    // T-10 value context: "actual operator threshold → level" per run.
+    id: "condition",
+    header: t("alerts.historyTable.condition"),
+    accessorKey: "actual_value",
+    sortable: false,
+    size: 220,
+    cell: " ",
+    meta: { align: "left" },
+  },
+  {
+    id: "retries",
+    header: t("alerts.retries"),
+    accessorKey: "retries",
+    sortable: true,
+    size: 64,
+    maxSize: 64,
+    meta: { align: "right" },
+  },
+  {
+    id: "dedup",
+    header: t("alerts.dedup"),
+    sortable: false,
+    size: 80,
+    maxSize: 80,
+    cell: " ",
+    meta: { align: "left" },
+  },
+  {
+    id: "actions",
+    header: t("common.actions"),
+    isAction: true,
+    pinned: "right",
+    size: 80,
+    minSize: 64,
+    maxSize: 100,
+    sortable: false,
+    meta: { align: "center", actionCount: 2 },
+  },
+]);
+
+// Computed
+// Methods
+const fetchAlertsList = async () => {
+  try {
+    const org = store.state.selectedOrganization.identifier;
+
+    // Fetch all alerts for the organization
+    const res = await alertsService.listByFolderId(
+      1,
+      1000,
+      "name",
+      false,
+      "",
+      org,
+      "", // all folders
+      "", // no query filter
+    );
+
+    if (res.data && res.data.list) {
+      // Store complete alert objects and sort by name
+      allAlerts.value = res.data.list
+        .map((alert: any) => ({
+          label: alert.name,
+          value: alert.alert_id,
+        }))
+        .sort((a: { label: string }, b: { label: string }) => a.label.localeCompare(b.label));
+      filteredAlertOptions.value = [...allAlerts.value];
+    }
+  } catch (error: any) {
+    console.error("Error fetching alerts list:", error);
+    // Silently fail - user can still type alert names manually
+  }
+};
+
+const onAlertSelected = (val: any) => {
+  if (val) {
+    // Extract the alert_id from the selected object
+    if (typeof val === "object" && val.value) {
+      searchQuery.value = val.value;
+    } else if (typeof val === "string") {
+      searchQuery.value = val;
+    }
+  }
+};
+
+const clearSearch = () => {
+  searchQuery.value = "";
+  selectedAlert.value = null;
+};
+
+const manualSearch = () => {
+  currentPage.value = 1;
+  fetchAlertHistory();
+};
+
+const fetchAlertHistory = async () => {
+  loading.value = true;
+  try {
+    const org = store.state.selectedOrganization.identifier;
+
+    const startTime = dateTimeValues.value.startTime;
+    const endTime = dateTimeValues.value.endTime;
+
+    const query: any = {
+      start_time: startTime.toString(),
+      end_time: endTime.toString(),
+      from: ((currentPage.value - 1) * pageSize.value).toString(),
+      size: pageSize.value.toString(),
+    };
+
+    if (searchQuery.value && searchQuery.value.trim()) {
+      query.alert_id = searchQuery.value.trim();
+    }
+
+    if (sortBy.value) {
+      query.sort_by = sortBy.value;
+      query.sort_order = sortOrder.value;
+    }
+
+    const response = await alertsService.getHistory(org, query);
+    if (response.data) {
+      const historyData = response.data;
+
+      rows.value = (historyData.hits || []).map((hit: any, index: number) => ({
+        ...hit,
+        id: `${hit.timestamp}_${index}`,
+      }));
+
+      totalCount.value = historyData.total || 0;
+
+      if (rows.value.length === 0) {
+        console.warn("No alert history found for the selected time range");
+      }
+    }
+  } catch (error: any) {
+    console.error("Error fetching alert history:", error);
+    console.error("Error response:", error.response);
+    toast({
+      variant: "error",
+      message: error.response?.data?.message || error.message || t("alerts.failedToFetchHistory"),
+    });
+  } finally {
+    loading.value = false;
+  }
+};
+
+const updateDateTime = (value: any) => {
+  dateTimeValues.value = {
+    startTime: value.startTime,
+    endTime: value.endTime,
+    type: value.relativeTimePeriod ? "relative" : "absolute",
+    relativeTimePeriod: value.relativeTimePeriod || "",
+  };
+
+  if (value.relativeTimePeriod) {
+    dateTimeType.value = "relative";
+    relativeTime.value = value.relativeTimePeriod;
+  } else {
+    dateTimeType.value = "absolute";
+    absoluteTime.value = {
+      startTime: value.startTime,
+      endTime: value.endTime,
+    };
+  }
+
+  currentPage.value = 1;
+  fetchAlertHistory();
+};
+
+const onPaginationChange = (params: { page: number; size: number }) => {
+  currentPage.value = params.page;
+  pageSize.value = params.size;
+  fetchAlertHistory();
+};
+
+const onSortChange = (params: { column: string; order: "asc" | "desc" }) => {
+  sortBy.value = params.column;
+  sortOrder.value = params.order;
+  fetchAlertHistory();
+};
+
+const refreshData = () => {
+  fetchAlertHistory();
+};
+
+const formatHistoryDate = (timestamp: number) => {
+  if (!timestamp) return "-";
+  // Convert microseconds to milliseconds
+  const dateObj = new Date(timestamp / 1000);
+  return formatDate(dateObj, "YYYY-MM-DD HH:mm:ss");
+};
+
+const formatDuration = (microseconds: number) => {
+  if (!microseconds || microseconds <= 0) return "0s";
+  const ms = microseconds / 1000;
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+
+  if (hours > 0) {
+    return `${hours}h ${minutes % 60}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${seconds % 60}s`;
+  }
+  return `${seconds}s`;
+};
+
+const showDetailsDialog = (row: any) => {
+  selectedRow.value = row;
+  detailsDialog.value = true;
+};
+
+const showErrorDialog = (error: string) => {
+  errorMessage.value = error;
+  errorDialog.value = true;
+};
+
+const closeErrorDialog = () => {
+  errorDialog.value = false;
+  errorMessage.value = null;
+};
+
+const goBack = () => {
+  router.push({
+    name: "alertList",
+    query: { org_identifier: store.state.selectedOrganization.identifier },
+  });
+};
+
+// Lifecycle
+onMounted(async () => {
+  // Fetch alerts list for dropdown
+  await fetchAlertsList();
+  // Fetch initial alert history
+  fetchAlertHistory();
+});
+
+// Watch for organization change
+watch(
+  () => store.state.selectedOrganization.identifier,
+  async () => {
+    // Re-fetch alerts list when organization changes
+    await fetchAlertsList();
+    // Reset search
+    clearSearch();
+    // Fetch history for new organization
+    fetchAlertHistory();
+  },
+);
+</script>

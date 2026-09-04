@@ -1,0 +1,116 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <div
+    class="feature-card mb-3"
+    v-if="showDeprecationWarning"
+    role="region"
+    :aria-label="t('components.databaseDeprecationBanner.ariaLabel')"
+    data-test="database-deprecation-banner-message"
+  >
+    <div class="flex items-center">
+      <div class="flex flex-col">
+        <span
+          class="text-text-heading text-base leading-6 font-semibold"
+          data-test="database-deprecation-banner-title"
+        >
+          {{ t("components.databaseDeprecationBanner.title") }}
+        </span>
+        <br />
+        <span
+          class="text-text-secondary text-sm leading-5 font-normal"
+          data-test="database-deprecation-banner-subtitle"
+        >
+          {{ t("components.databaseDeprecationBanner.description") }}
+        </span>
+      </div>
+      <div class="col-auto ms-2">
+        <OButton variant="ghost" size="icon-sm" icon-left="close" @click="dismissWarning" />
+      </div>
+    </div>
+  </div>
+</template>
+
+<script lang="ts">
+import { defineComponent, ref, onMounted } from "vue";
+import { useI18nTyped } from "@/types/i18n";
+import { useStore } from "vuex";
+import OButton from "@/lib/core/Button/OButton.vue";
+
+const DISMISS_KEY = "mysql_deprecation_dismissed";
+const DISMISS_DURATION_DAYS = 7;
+
+export default defineComponent({
+  name: "DatabaseDeprecationBanner",
+  components: { OButton },
+  setup() {
+    const { t } = useI18nTyped();
+    const store = useStore();
+    const showDeprecationWarning = ref(false);
+
+    const checkIfShouldShow = () => {
+      // Check if MySQL is being used
+      const config = store.state.zoConfig;
+      if (!config || !config.mysql_deprecated_warning) {
+        return false;
+      }
+
+      // Check if user has dismissed the warning recently
+      const dismissedData = localStorage.getItem(DISMISS_KEY);
+      if (dismissedData) {
+        try {
+          const { timestamp } = JSON.parse(dismissedData);
+          const dismissedDate = new Date(timestamp);
+          const currentDate = new Date();
+          const daysSinceDismissal = Math.floor(
+            (currentDate.getTime() - dismissedDate.getTime()) / (1000 * 60 * 60 * 24),
+          );
+
+          // Show again if more than DISMISS_DURATION_DAYS have passed
+          if (daysSinceDismissal < DISMISS_DURATION_DAYS) {
+            return false;
+          }
+        } catch (e) {
+          // Invalid data, show the warning
+          console.warn("Invalid dismiss data, showing warning");
+        }
+      }
+
+      return true;
+    };
+
+    const dismissWarning = () => {
+      const dismissData = {
+        timestamp: new Date().toISOString(),
+      };
+      localStorage.setItem(DISMISS_KEY, JSON.stringify(dismissData));
+      showDeprecationWarning.value = false;
+    };
+
+    onMounted(() => {
+      showDeprecationWarning.value = checkIfShouldShow();
+    });
+
+    return {
+      t,
+      store,
+      showDeprecationWarning,
+      dismissWarning,
+    };
+  },
+});
+</script>

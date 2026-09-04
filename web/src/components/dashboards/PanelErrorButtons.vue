@@ -1,0 +1,200 @@
+<template>
+  <div
+    v-if="
+      error ||
+      maxQueryRangeWarning ||
+      limitNumberOfSeriesWarningMessage ||
+      sparklineWarning ||
+      xAliasInconsistencyWarning ||
+      isCachedDataDifferWithCurrentTimeRange ||
+      (isPartialData && !isPanelLoading) ||
+      (lastTriggeredAt && !viewOnly && !simplifiedPanelView)
+    "
+    class="flex flex-nowrap items-center"
+  >
+    <OButton
+      v-if="error"
+      :key="error"
+      variant="ghost-warning"
+      size="icon"
+      icon-left="warning"
+      data-test="panel-error-data"
+    >
+      <OTooltip side="bottom" align="end" max-width="26.25rem" hoverable>
+        <template #content
+          ><div class="whitespace-pre-wrap">{{ error }}</div></template
+        >
+      </OTooltip>
+    </OButton>
+    <OButton
+      v-if="maxQueryRangeWarning"
+      variant="ghost-warning"
+      size="icon"
+      icon-left="warning"
+      data-test="panel-max-duration-warning"
+    >
+      <OTooltip side="bottom" align="end" max-width="26.25rem" hoverable>
+        <template #content
+          ><div class="whitespace-pre-wrap" data-test="panel-max-duration-warning-content">
+            {{ maxQueryRangeWarning }}
+          </div></template
+        >
+      </OTooltip>
+    </OButton>
+    <OButton
+      v-if="limitNumberOfSeriesWarningMessage"
+      variant="ghost-warning"
+      size="icon"
+      data-test="panel-limit-number-of-series-warning"
+    >
+      <template #icon-left><OIcon name="data-info-alert" size="sm" /></template>
+      <OTooltip side="bottom" align="end" hoverable>
+        <template #content
+          ><div class="whitespace-pre-wrap">{{ limitNumberOfSeriesWarningMessage }}</div></template
+        >
+      </OTooltip>
+    </OButton>
+    <OButton
+      v-if="sparklineWarning"
+      variant="ghost-warning"
+      size="icon"
+      data-test="panel-sparkline-warning"
+    >
+      <template #icon-left><OIcon name="show-chart" size="sm" /></template>
+      <OTooltip side="bottom" align="end" max-width="26.25rem" hoverable>
+        <template #content
+          ><div class="whitespace-pre-wrap" data-test="panel-sparkline-warning-content">
+            {{ sparklineWarning }}
+          </div></template
+        >
+      </OTooltip>
+    </OButton>
+    <OButton
+      v-if="xAliasInconsistencyWarning"
+      variant="ghost-warning"
+      size="icon"
+      icon-left="warning"
+      data-test="panel-x-alias-inconsistency-warning"
+    >
+      <OTooltip side="bottom" align="end" max-width="26.25rem" hoverable>
+        <template #content>
+          <div class="whitespace-pre-wrap">{{ t("dashboard.xAliasInconsistencyWarning") }}</div>
+        </template>
+      </OTooltip>
+    </OButton>
+    <OButton
+      v-if="isCachedDataDifferWithCurrentTimeRange"
+      variant="ghost-warning"
+      size="icon"
+      data-test="panel-is-cached-data-differ-with-current-time-range-warning"
+    >
+      <template #icon-left><OIcon name="running-with-errors" size="sm" /></template>
+      <OTooltip
+        side="bottom"
+        align="end"
+        hoverable
+        :content="t('dashboard.panelErrorButtons.cachedDataDiffers')"
+      />
+    </OButton>
+    <OButton
+      v-if="isPartialData && !isPanelLoading"
+      variant="ghost-warning"
+      size="icon"
+      data-test="panel-partial-data-warning"
+    >
+      <template #icon-left><OIcon name="clock-loader-20" size="sm" /></template>
+      <OTooltip
+        side="bottom"
+        align="end"
+        hoverable
+        :content="t('dashboard.panelErrorButtons.partialData')"
+      />
+    </OButton>
+
+    <!-- Universal Last Refreshed Clock Icon and Time -->
+    <span
+      v-if="lastTriggeredAt && !viewOnly && !simplifiedPanelView"
+      class="lastRefreshedAt ms-1.25 overflow-hidden text-[smaller] text-ellipsis whitespace-nowrap"
+      data-test="panel-last-refreshed-at"
+    >
+      <span class="lastRefreshedAtIcon me-0.5 text-[smaller]">
+        {{ "🕑" }}
+        <OTooltip side="bottom" align="end">
+          <template #content
+            >{{ t("dashboard.panelErrorButtons.lastRefreshed")
+            }}<RelativeTime :timestamp="lastTriggeredAt"
+          /></template>
+        </OTooltip>
+      </span>
+      <RelativeTime
+        :timestamp="lastTriggeredAt"
+        :fullTimePrefix="t('dashboard.panelErrorButtons.lastRefreshedAt')"
+      />
+    </span>
+  </div>
+</template>
+
+<script lang="ts">
+import { defineComponent } from "vue";
+import { useI18nTyped } from "@/types/i18n";
+import RelativeTime from "@/components/common/RelativeTime.vue";
+import OButton from "@/lib/core/Button/OButton.vue";
+import OIcon from "@/lib/core/Icon/OIcon.vue";
+import OTooltip from "@/lib/overlay/Tooltip/OTooltip.vue";
+export default defineComponent({
+  name: "PanelErrorButtons",
+  components: { RelativeTime, OButton, OIcon, OTooltip },
+  props: {
+    error: {
+      type: String,
+      default: "",
+    },
+    maxQueryRangeWarning: {
+      type: String,
+      default: "",
+    },
+    limitNumberOfSeriesWarningMessage: {
+      type: String,
+      default: "",
+    },
+    sparklineWarning: {
+      type: String,
+      default: "",
+    },
+    isCachedDataDifferWithCurrentTimeRange: {
+      type: Boolean,
+      default: false,
+    },
+    isPartialData: {
+      type: Boolean,
+      default: false,
+    },
+    isPanelLoading: {
+      type: Boolean,
+      default: false,
+    },
+    lastTriggeredAt: {
+      type: [String, Number, Date, null],
+      default: null,
+    },
+    viewOnly: {
+      type: Boolean,
+      default: false,
+    },
+    simplifiedPanelView: {
+      type: Boolean,
+      default: false,
+    },
+    xAliasInconsistencyWarning: {
+      type: Boolean,
+      default: false,
+    },
+  },
+  setup() {
+    const { t } = useI18nTyped();
+    return {
+      t,
+    };
+  },
+});
+</script>

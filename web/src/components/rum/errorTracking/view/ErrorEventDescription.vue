@@ -1,0 +1,83 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <div class="overflow-hidden wrap-break-word whitespace-break-spaces">
+    <template v-if="column.type === 'view' && column.view_loading_type === 'route_change'">
+      <pre
+        data-test="error-event-description-navigation"
+        class="bg-surface-subtle rounded-default p-2"
+      >
+{
+  <span class="text-primary">{{ t('rum.from') }}</span> : {{ column.view_referrer }},
+  <span class="text-primary">{{ t('rum.to') }}</span> : {{ column.view_url }}
+}</pre>
+    </template>
+    <template v-else-if="column.type === 'resource' && column.resource_type === 'xhr'">
+      <span class="pe-2 text-xs font-bold">{{ column.resource_method }}</span>
+      <a
+        :href="column.resource_url"
+        target="_blank"
+        data-test="error-event-description-resource-url"
+        class="resource-url text-primary text-sm no-underline"
+        >{{ column.resource_url }}</a
+      >
+      <span class="ps-2">[ {{ column.resource_status_code }} ]</span>
+    </template>
+    <template v-else>
+      <span data-test="error-event-description-default" class="text-sm">{{ getDescription }}</span>
+    </template>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { rumField } from "@/utils/rum/fields";
+import { computed } from "vue";
+import { useI18nTyped } from "@/types/i18n";
+
+const { t } = useI18nTyped();
+
+const props = defineProps({
+  column: {
+    type: Object,
+    required: true,
+  },
+});
+
+// resource : resource_url
+// error : error_message
+// view : view_referrer -> view_ur
+// action :  <ns>_action_target_text : <ns>_action_target_selector  (_o2_ or _oo_)
+const getDescription = computed(() => {
+  if (props.column["type"] === "resource") {
+    return props.column["resource_url"];
+  } else if (props.column["type"] === "error") {
+    return props.column["error_message"];
+  } else if (props.column["type"] === "view") {
+    if (props.column.view_loading_type === "route_change") {
+      return props.column["view_referrer"] + " to " + props.column["view_url"];
+    }
+    return props.column["view_url"];
+  } else if (props.column["type"] === "action") {
+    return (
+      rumField(props.column, "action_target_text") +
+      " : " +
+      rumField(props.column, "action_target_selector")
+    );
+  }
+  return "";
+});
+</script>

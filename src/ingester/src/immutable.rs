@@ -1,0 +1,435 @@
+// Copyright 2026 OpenObserve Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+use std::{
+    path::PathBuf,
+    sync::{Arc, LazyLock as Lazy},
+};
+
+use config::{
+    RwAHashSet, metrics,
+    stats::{CacheStatsAsync, MemorySize},
+};
+use hashbrown::HashSet;
+use snafu::ResultExt;
+use tokio::{fs, sync::mpsc};
+
+use crate::{
+    ReadRecordBatchEntry,
+    entry::PersistStat,
+    errors::{DeleteFileSnafu, RenameFileSnafu, Result, TokioMpscSendSnafu, WriteDataSnafu},
+    memtable::MemTable,
+    pack::PackWriter,
+    rwmap::RwIndexMap,
+    writer::WriterKey,
+};
+
+pub(crate) static IMMUTABLES: Lazy<RwIndexMap<PathBuf, Arc<Immutable>>> =
+    Lazy::new(RwIndexMap::default);
+
+static PROCESSING_TABLES: Lazy<RwAHashSet<PathBuf>> = Lazy::new(Default::default);
+
+pub(crate) struct Immutable {
+    idx: usize,
+    key: WriterKey,
+    memtable: MemTable,
+}
+
+impl MemorySize for Immutable {
+    fn mem_size(&self) -> usize {
+        std::mem::size_of::<Immutable>() + self.key.mem_size() + self.memtable.mem_size()
+    }
+}
+
+pub async fn read_from_immutable(
+    trace_id: &str,
+    org_id: &str,
+    stream_type: &str,
+    stream_name: &str,
+    time_range: Option<(i64, i64)>,
+    partition_filters: &[(String, Vec<String>)],
+    memtable_ids: &HashSet<u64>,
+) -> Result<(Vec<u64>, Vec<ReadRecordBatchEntry>)> {
+    let shared_memtable = config::get_config().common.feature_shared_memtable_enabled;
+    let r = IMMUTABLES.read().await;
+    let mut ids = Vec::with_capacity(r.len());
+    let mut batches = Vec::with_capacity(r.len());
+    for (_, i) in r.iter() {
+        if stream_type == i.key.stream_type.as_ref()
+            && (shared_memtable || org_id == i.key.org_id.as_ref())
+        {
+            let (id, batche) =
+                i.memtable
+                    .read(org_id, stream_name, time_range, partition_filters)?;
+            if memtable_ids.contains(&id) {
+                log::debug!(
+                    "[trace_id {trace_id}] skip immutable memtable id: {id} already in memtable",
+                );
+                continue;
+            }
+            ids.push(id);
+            batches.extend(batche);
+        }
+    }
+    Ok((ids, batches))
+}
+
+/// Delete a file. Returns whether the file existed (false = already deleted).
+async fn remove_file_if_exists(path: &PathBuf) -> Result<bool> {
+    match fs::remove_file(path).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).context(DeleteFileSnafu { path }),
+    }
+}
+
+impl Immutable {
+    pub(crate) fn new(idx: usize, key: WriterKey, memtable: MemTable) -> Self {
+        Self { idx, key, memtable }
+    }
+
+    pub(crate) async fn persist(&self, wal_path: &PathBuf) -> Result<PersistStat> {
+        if self.key.stream_type.as_ref() == "metrics"
+            && config::get_config().common.feature_wal_pack_enabled
+        {
+            self.persist_pack(wal_path).await
+        } else {
+            self.persist_files(wal_path).await
+        }
+    }
+
+    async fn persist_files(&self, wal_path: &PathBuf) -> Result<PersistStat> {
+        let mut persist_stat = PersistStat::default();
+        // 1. dump memtable to disk
+        let (schema_size, paths) = self
+            .memtable
+            .persist(
+                self.memtable.id(),
+                self.idx,
+                &self.key.org_id,
+                &self.key.stream_type,
+                None,
+            )
+            .await?;
+        persist_stat.arrow_size += schema_size;
+        // 2. create a lock file
+        let done_path = wal_path.with_extension("lock");
+        let lock_data = paths
+            .iter()
+            .map(|(p, ..)| p.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&done_path, lock_data.as_bytes())
+            .await
+            .context(WriteDataSnafu)?;
+        // 3. delete wal file. if it is already gone, another persist (the wal
+        // replay task) won the race and the data is already persisted:
+        // discard our dumped files instead of renaming them, otherwise the
+        // data would be duplicated
+        if !remove_file_if_exists(wal_path).await? {
+            log::warn!(
+                "wal file {} already deleted by another persist, discarding {} dumped files",
+                wal_path.display(),
+                paths.len()
+            );
+            for (path, stat) in paths {
+                persist_stat += stat;
+                let _ = fs::remove_file(&path).await;
+            }
+            remove_file_if_exists(&done_path).await?;
+            return Ok(persist_stat);
+        }
+        // 4. rename the tmp files to parquet files
+        for (path, stat) in paths {
+            persist_stat += stat;
+            fs::rename(&path, &path.with_extension("parquet"))
+                .await
+                .context(RenameFileSnafu { path: &path })?;
+        }
+        // 5. delete the lock file
+        remove_file_if_exists(&done_path).await?;
+        Ok(persist_stat)
+    }
+
+    /// Persist the memtable into pack files, following the same lock-file
+    /// crash-recovery flow as `persist_files`.
+    async fn persist_pack(&self, wal_path: &PathBuf) -> Result<PersistStat> {
+        let cfg = config::get_config();
+        // 1. dump memtable into pack files (kept as .pack.tmp, fsynced)
+        let mut pack_writer = PackWriter::new(
+            self.idx,
+            self.memtable.id(),
+            &self.key.stream_type,
+            cfg.limit.max_file_size_on_disk as u64,
+        );
+        let (schema_size, _) = self
+            .memtable
+            .persist(
+                self.memtable.id(),
+                self.idx,
+                &self.key.org_id,
+                &self.key.stream_type,
+                Some(&mut pack_writer),
+            )
+            .await?;
+        let (finished, mut persist_stat, bytes_by_org) = pack_writer.finish().await?;
+        persist_stat.arrow_size += schema_size;
+
+        // empty memtable: nothing was written, just delete the wal file
+        if finished.is_empty() {
+            remove_file_if_exists(wal_path).await?;
+            return Ok(persist_stat);
+        }
+
+        // 2. create a lock file listing the tmp pack files
+        let done_path = wal_path.with_extension("lock");
+        let lock_data = finished
+            .iter()
+            .map(|p| p.tmp_path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&done_path, lock_data.as_bytes())
+            .await
+            .context(WriteDataSnafu)?;
+        // 3. delete wal file. if it is already gone, another persist won the
+        // race: discard our tmp packs to avoid duplicating the data
+        if !remove_file_if_exists(wal_path).await? {
+            log::warn!(
+                "wal file {} already deleted by another persist, discarding {} tmp pack files",
+                wal_path.display(),
+                finished.len()
+            );
+            for pack in finished.iter() {
+                let _ = fs::remove_file(&pack.tmp_path).await;
+            }
+            remove_file_if_exists(&done_path).await?;
+            return Ok(persist_stat);
+        }
+        // 4. rename the tmp files to pack files and register the segments
+        for pack in finished.iter() {
+            fs::rename(&pack.tmp_path, &pack.path)
+                .await
+                .context(RenameFileSnafu {
+                    path: &pack.tmp_path,
+                })?;
+            crate::pack::register_pack(
+                pack.path.clone(),
+                &pack.footer,
+                config::utils::time::now_micros(),
+                &Default::default(),
+            )
+            .await;
+            log::info!(
+                "[INGESTER:PACK:{}] persisted pack file: {}, size: {}, segments: {}",
+                self.idx,
+                pack.path.display(),
+                pack.size,
+                pack.footer.segments.len(),
+            );
+        }
+        // 5. delete the lock file
+        remove_file_if_exists(&done_path).await?;
+
+        // update metrics
+        for (org_id, bytes) in bytes_by_org {
+            metrics::INGEST_WAL_USED_BYTES
+                .with_label_values(&[org_id.as_str(), self.key.stream_type.as_ref()])
+                .add(bytes);
+            metrics::INGEST_WAL_WRITE_BYTES
+                .with_label_values(&[org_id.as_str(), self.key.stream_type.as_ref()])
+                .inc_by(bytes as u64);
+        }
+
+        Ok(persist_stat)
+    }
+}
+
+pub(crate) async fn persist(tx: mpsc::Sender<PathBuf>) -> Result<()> {
+    let r = IMMUTABLES.read().await;
+    let n = r.len();
+    let mut paths = Vec::with_capacity(n);
+    for item in r.iter() {
+        if paths.len() >= n {
+            break;
+        }
+        paths.push(item.0.clone());
+    }
+    drop(r);
+    for path in paths {
+        // check if the file is processing
+        if PROCESSING_TABLES.read().await.contains(&path) {
+            continue;
+        }
+        tx.send(path.clone()).await.context(TokioMpscSendSnafu)?;
+        PROCESSING_TABLES.write().await.insert(path);
+    }
+
+    IMMUTABLES.write().await.shrink_to_fit();
+    PROCESSING_TABLES.write().await.shrink_to_fit();
+
+    Ok(())
+}
+
+pub(crate) async fn persist_table(idx: usize, path: PathBuf) -> Result<()> {
+    let start = std::time::Instant::now();
+    let r = IMMUTABLES.read().await;
+    let Some(immutable) = r.get(&path) else {
+        return Ok(());
+    };
+    let immutable = immutable.clone();
+    drop(r);
+
+    log::info!(
+        "[INGESTER:MEM:{idx}] starts persist file: {}, took: {} ms",
+        path.to_string_lossy(),
+        start.elapsed().as_millis(),
+    );
+
+    // persist entry to local disk
+    let start = std::time::Instant::now();
+    let ret = immutable.persist(&path).await;
+    let stat = match ret {
+        Ok(v) => v,
+        Err(e) => {
+            // remove from processing tables
+            PROCESSING_TABLES.write().await.remove(&path);
+            return Err(e);
+        }
+    };
+    log::info!(
+        "[INGESTER:MEM:{idx}] finish persist file: {}, json_size: {}, arrow_size: {}, file_num: {} batch_num: {}, records: {}, took: {} ms",
+        path.to_string_lossy(),
+        stat.json_size,
+        stat.arrow_size,
+        stat.file_num,
+        stat.batch_num,
+        stat.records,
+        start.elapsed().as_millis(),
+    );
+
+    // remove entry
+    let mut rw = IMMUTABLES.write().await;
+    rw.swap_remove(&path);
+    drop(rw);
+
+    // remove from processing tables
+    PROCESSING_TABLES.write().await.remove(&path);
+
+    // update metrics
+    metrics::INGEST_MEMTABLE_BYTES
+        .with_label_values::<&str>(&[])
+        .sub(stat.json_size);
+    metrics::INGEST_MEMTABLE_ARROW_BYTES
+        .with_label_values::<&str>(&[])
+        .sub(stat.arrow_size as i64);
+    metrics::INGEST_MEMTABLE_FILES
+        .with_label_values::<&str>(&[])
+        .dec();
+
+    Ok(())
+}
+
+// check if the persist is done for the given seq_id
+// if there is no id less than the given seq_id, return true
+pub async fn check_persist_done(seq_id: u64) -> bool {
+    let r = IMMUTABLES.read().await;
+    let mut min_id = u64::MAX;
+    for (_, i) in r.iter() {
+        if i.memtable.id() < seq_id {
+            min_id = min_id.min(i.memtable.id());
+        }
+    }
+    min_id < seq_id
+}
+
+pub async fn get_immutables_cache_stats() -> (usize, usize, usize) {
+    IMMUTABLES.stats().await
+}
+
+pub async fn get_processing_tables_cache_stats() -> (usize, usize, usize) {
+    PROCESSING_TABLES.stats().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_get_immutables_cache_stats() {
+        // Test that get_immutables_cache_stats returns valid tuple structure
+        let (total_size, used_size, _item_len) = get_immutables_cache_stats().await;
+
+        // used_size should not exceed total_size
+        assert!(used_size <= total_size);
+    }
+
+    #[tokio::test]
+    async fn test_get_immutables_cache_stats_consistency() {
+        // Test that stats returns valid values across multiple calls
+        // Note: In a concurrent test environment, values may change due to other tests
+        let (total1, used1, len1) = get_immutables_cache_stats().await;
+        let (total2, used2, len2) = get_immutables_cache_stats().await;
+
+        // Total size should remain consistent
+        assert_eq!(total1, total2);
+
+        // Used size and length may change due to concurrent tests, but should not vary wildly
+        let used_diff = used2.abs_diff(used1);
+        let len_diff = len2.abs_diff(len1);
+        assert!(used_diff < 100000 || used1 == 0 || used2 == 0);
+        assert!(len_diff < 100 || len1 == 0 || len2 == 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_processing_tables_cache_stats() {
+        // Test that get_processing_tables_cache_stats returns valid tuple structure
+        let (total_size, used_size, _item_len) = get_processing_tables_cache_stats().await;
+
+        // used_size should not exceed total_size
+        assert!(used_size <= total_size);
+    }
+
+    #[tokio::test]
+    async fn test_get_processing_tables_cache_stats_consistency() {
+        // Test that stats returns valid values across multiple calls
+        // Note: In a concurrent test environment, values may change due to other tests
+        let (total1, used1, len1) = get_processing_tables_cache_stats().await;
+        let (total2, used2, len2) = get_processing_tables_cache_stats().await;
+
+        // Total size should remain consistent
+        assert_eq!(total1, total2);
+
+        // Used size and length may change due to concurrent tests, but should not vary wildly
+        let used_diff = used2.abs_diff(used1);
+        let len_diff = len2.abs_diff(len1);
+        assert!(used_diff < 100000 || used1 == 0 || used2 == 0);
+        assert!(len_diff < 100 || len1 == 0 || len2 == 0);
+    }
+
+    #[tokio::test]
+    async fn test_both_cache_stats_functions() {
+        // Test that both functions work correctly when called together
+        let immutables_stats = get_immutables_cache_stats().await;
+        let processing_stats = get_processing_tables_cache_stats().await;
+
+        // Both should return valid tuples
+        assert!(immutables_stats.1 <= immutables_stats.0);
+        assert!(processing_stats.1 <= processing_stats.0);
+
+        // Both functions should be callable independently
+        let _ = get_immutables_cache_stats().await;
+        let _ = get_processing_tables_cache_stats().await;
+    }
+}

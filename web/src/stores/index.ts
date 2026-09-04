@@ -1,0 +1,599 @@
+// Copyright 2026 OpenObserve Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import type { I18nText } from "@/types/i18n";
+import type { TraceTimeRange } from "@/ts/interfaces/traces/traceTimeRange.types";
+
+import { createStore } from "vuex";
+import { useLocalOrganization, useLocalCurrentUser, useLocalTimezone } from "../utils/zincutils";
+import streams from "./streams";
+import logs from "./logs";
+import incidents from "./incidents";
+import { getDefaultTheme } from "@/constants/themes";
+
+const pos = window.location.pathname.indexOf("/web/");
+
+const API_ENDPOINT = import.meta.env.VITE_OPENOBSERVE_ENDPOINT
+  ? import.meta.env.VITE_OPENOBSERVE_ENDPOINT.endsWith("/")
+    ? import.meta.env.VITE_OPENOBSERVE_ENDPOINT.slice(0, -1)
+    : import.meta.env.VITE_OPENOBSERVE_ENDPOINT
+  : window.location.origin == "http://localhost:8081"
+    ? "/"
+    : pos > -1
+      ? window.location.origin + window.location.pathname.slice(0, pos)
+      : window.location.origin;
+
+const organizationObj = {
+  organizationPasscode: "",
+  organizationPasscodeUser: "",
+  allDashboardList: {},
+  allDashboardData: {},
+  allAlertsListByFolderId: {},
+  allAlertsListByNames: {},
+  allReportsListByFolderId: {} as Record<string, any[]>,
+  allDashboardListHash: {},
+  rumToken: {
+    rum_token: "",
+  },
+  // Which traces stream contains a given (canonical 32-char) trace id, and the
+  // range it ran in when the time index knew — see useCorrelatedTracesStream.
+  // knownStreams is the org-level fact ("streams that have ever contained a
+  // correlated trace") that keeps steady-state resolution at one point lookup.
+  // Lives here so resetOrganizationData wipes it on org switch.
+  correlatedTracesStreams: {
+    byTraceId: {} as Record<string, { stream: string; range?: TraceTimeRange }>,
+    knownStreams: [] as string[],
+  },
+  quotaThresholdMsg: "",
+  functions: [],
+  streams: {},
+  folders: [],
+  foldersByType: [],
+  organizationSettings: {
+    scrape_interval: 15,
+    trace_id_field_name: "trace_id",
+    span_id_field_name: "span_id",
+    free_trial_expiry: "",
+    cross_links: [],
+    usage_stream_enabled: false,
+  },
+  isDataIngested: false,
+  regexPatterns: [],
+  regexPatternPrompt: "",
+  regexPatternTestValue: "",
+  orgTokens: [] as Array<{
+    name: string;
+    token: string;
+    description: I18nText;
+    is_default: boolean;
+    enabled: boolean;
+    created_by: string;
+    created_at: number;
+  }>,
+};
+
+export default createStore({
+  state: {
+    API_ENDPOINT: API_ENDPOINT,
+    userInfo: {},
+    loggedIn: false,
+    loadingState: true,
+    errorLoadingState: false,
+    selectedOrganization: useLocalOrganization() ? useLocalOrganization() : {},
+    organizations: [],
+    currentuser: useLocalCurrentUser() ? useLocalCurrentUser() : {},
+    searchCollapsibleSection: 20,
+    theme: "",
+    printMode: false,
+    organizationData: JSON.parse(JSON.stringify(organizationObj)),
+    zoConfig: <{ [key: string]: any }>{},
+    timezone: useLocalTimezone()
+      ? useLocalTimezone()
+      : Intl.DateTimeFormat().resolvedOptions().timeZone,
+    savedViewDialog: false,
+    refreshIntervalID: 0,
+    savedViewFlag: false,
+    savedFunctionDialog: false,
+    regionInfo: [],
+    hiddenMenus: [],
+    sessionId: "",
+    webSocketUrl: "",
+    allApiLimitsByOrgId: {},
+    allRoleLimitsByOrgIdByRole: {},
+    modulesToDisplay: {},
+    isAiChatEnabled: false,
+    isAiChatExpanded: false,
+    isWebinarBannerVisible: false,
+    currentChatTimestamp: null as number | null,
+    chatUpdated: false,
+    // Default theme colors — derived from the default theme (O2 Signature) in the
+    // theme registry so there is a single source of truth. Used as the fallback
+    // by chart consumers that read colors directly. Changing the default theme's
+    // colors in `@/constants/themes` automatically updates these.
+    defaultThemeColors: {
+      light: getDefaultTheme().light.themeColor,
+      dark: getDefaultTheme().dark.themeColor,
+    },
+    // GitHub dashboard gallery cache
+    githubDashboardGallery: {
+      dashboards: [],
+      lastFetched: null as number | null,
+      cacheExpiry: 10 * 60 * 1000, // 10 minutes in milliseconds
+      dashboardJsonCache: {} as Record<string, unknown>, // Cache for individual dashboard JSON content: { folderPath/fileName: jsonContent }
+    },
+    // Alert library cache (source: S3, see composables/useAlertLibrary.ts).
+    // This is the READ cache, not a write-through mirror: the composable reads
+    // it back, so a second component mounting after navigation is served from
+    // here rather than refetching 47 KB.
+    alertLibrary: {
+      manifest: null as unknown,
+      lastFetched: null as number | null,
+      cacheExpiry: 10 * 60 * 1000, // 10 minutes, matching the gallery above
+      // Whole alert files, keyed by the manifest's stable `<pack>/<name>` id —
+      // never by bare name, which is only unique within a pack.
+      fileCache: {} as Record<string, unknown>,
+    },
+    // Temporary theme colors for live preview in General Settings
+    // These colors are stored here (instead of component state) so they persist
+    // across navigation and are accessible to all components for preview
+    // - Set when user drags color picker in General Settings
+    // - Applied by App.vue and PredefinedThemes.vue for live preview
+    // - Cleared when user clicks "Save" (saved permanently to localStorage & backend)
+    // - Prevents other watchers/observers from overriding the preview color
+    tempThemeColors: {
+      light: null, // Hex color string (e.g., "#FF0000") or null
+      dark: null, // Hex color string (e.g., "#0000FF") or null
+    } as Record<"light" | "dark", string | null>,
+    // Share URL state for Safari-compatible clipboard copy
+    // Polling mechanism checks this value and copies when available
+    pendingShortURL: null,
+    // Alert list filter state — persisted across navigation so returning
+    // from add/edit alert screens restores the previous search & toggle state
+    alertListFilters: {
+      searchQuery: "",
+      filterQuery: "",
+      searchAcrossFolders: false,
+    },
+  },
+  mutations: {
+    login(state, payload) {
+      if (payload) {
+        state.loggedIn = payload.loginState;
+        state.userInfo = payload.userInfo;
+      }
+    },
+    logout(state) {
+      state.loggedIn = false;
+      state.userInfo = {};
+    },
+    endpoint(state, payload) {
+      state.API_ENDPOINT = payload;
+    },
+    setUserInfo(state, payload) {
+      state.userInfo = payload;
+    },
+    // setIndexData(state, payload) {
+    //   state.indexData = payload;
+    // },
+    setSelectedOrganization(state, payload) {
+      state.selectedOrganization = payload;
+    },
+    setOrganizations(state, payload) {
+      state.organizations = payload;
+    },
+    setCurrentUser(state, payload) {
+      state.currentuser = payload;
+    },
+    setSearchCollapseToggle(state, payload) {
+      state.searchCollapsibleSection = payload;
+    },
+    setOrganizationPasscode(state, payload) {
+      state.organizationData.organizationPasscode = payload;
+    },
+    setOrganizationPasscodeUser(state, payload) {
+      state.organizationData.organizationPasscodeUser = payload;
+    },
+    resetOrganizationData(state) {
+      state.organizationData = JSON.parse(JSON.stringify(organizationObj));
+    },
+    setRUMToken(state, payload) {
+      state.organizationData.rumToken = payload;
+    },
+    setCorrelatedTracesStream(
+      state,
+      payload: { traceId: string; stream: string; range?: TraceTimeRange },
+    ) {
+      const cache = state.organizationData.correlatedTracesStreams;
+      // Bounded: past the cap, clear and restart. knownStreams survives, so a
+      // re-resolution of any dropped id is a single point lookup — LRU would
+      // be bookkeeping for ~100KB of strings.
+      if (Object.keys(cache.byTraceId).length >= 1000) cache.byTraceId = {};
+      // The range is absent whenever the answer came from the probe fallback.
+      cache.byTraceId[payload.traceId] = { stream: payload.stream, range: payload.range };
+      if (!cache.knownStreams.includes(payload.stream)) cache.knownStreams.push(payload.stream);
+    },
+    setOrgTokens(state, payload) {
+      state.organizationData.orgTokens = payload;
+    },
+    // setAllCurrentDashboards(state, payload) {
+    //   state.allCurrentDashboards = payload;
+    // },
+    // setCurrentSelectedDashboard(state, payload) {
+    //   state.currentSelectedDashboard = payload;
+    // },
+    setAllDashboardList(state, payload) {
+      state.organizationData.allDashboardList = payload;
+    },
+    setAllAlertsListByFolderId(state, payload) {
+      state.organizationData.allAlertsListByFolderId = payload;
+    },
+    setAllReportsListByFolderId(state, payload) {
+      state.organizationData.allReportsListByFolderId = payload;
+    },
+    setAllAlertsListByNames(state, payload) {
+      state.organizationData.allAlertsListByNames = payload;
+    },
+    setDashboardData(state, payload) {
+      state.organizationData.allDashboardData = payload;
+    },
+    setAllDashboardListHash(state, payload) {
+      state.organizationData.allDashboardListHash = payload;
+    },
+    setOrganizationSettings(state, payload) {
+      state.organizationData.organizationSettings = payload;
+    },
+    setFunctions(state, payload) {
+      state.organizationData.functions = payload;
+    },
+    setStreams(state, payload) {
+      state.organizationData.streams[payload.name] = payload;
+    },
+    resetStreams(state, payload) {
+      state.organizationData.streams = payload;
+    },
+    // setSearch(state, payload) {
+    //   state.search = payload;
+    // },
+    // setStreamFields(state, payload) {
+    //   state.streamFields = payload;
+    // },
+    // setCurrentPanelsData(state, payload) {
+    //   state.currentPanelsData = payload;
+    // },
+    setConfig(state, payload) {
+      state.zoConfig = payload;
+    },
+    setFolders(state, payload) {
+      state.organizationData.folders = payload;
+    },
+    setFoldersByType(state, payload) {
+      // Every caller commits ONE type's folders ({ alerts: [...] }), so replacing
+      // the whole map made each module's fetch wipe every other module's cached
+      // folders. Worst with a late-resolving fetch from a page the user has left:
+      // opening the alert form and going back to Dashboards landed on a folder
+      // sidebar holding nothing but Favorites.
+      state.organizationData.foldersByType = {
+        ...state.organizationData.foldersByType,
+        ...payload,
+      };
+    },
+    appTheme(state, payload) {
+      state.theme = payload;
+    },
+    setPrintMode(state, payload) {
+      state.printMode = payload;
+    },
+    setTimezone(state, payload) {
+      state.timezone = payload;
+    },
+    setSavedViewDialog(state, payload) {
+      state.savedViewDialog = payload;
+    },
+    setRefreshIntervalID(state, payload) {
+      state.refreshIntervalID = payload;
+    },
+    setSavedViewFlag(state, payload) {
+      state.savedViewFlag = payload;
+    },
+    setSavedFunctionDialog(state, payload) {
+      state.savedFunctionDialog = payload;
+    },
+    setIsDataIngested(state, payload) {
+      state.organizationData.isDataIngested = payload;
+    },
+    setRegionInfo(state, payload) {
+      state.regionInfo = payload;
+    },
+    setHiddenMenus(state, payload) {
+      state.hiddenMenus = payload;
+    },
+    setApiLimitsByOrgId(state, payload) {
+      state.allApiLimitsByOrgId = payload;
+    },
+    setRoleLimitsByOrgIdByRole(state, payload) {
+      state.allRoleLimitsByOrgIdByRole = payload;
+    },
+    setModulesToDisplay(state, payload) {
+      state.modulesToDisplay = payload;
+    },
+    setIsAiChatEnabled(state, payload) {
+      state.isAiChatEnabled = payload;
+    },
+    setIsAiChatExpanded(state, payload) {
+      state.isAiChatExpanded = payload;
+    },
+    setIsWebinarBannerVisible(state, payload) {
+      state.isWebinarBannerVisible = payload;
+    },
+    setCurrentChatTimestamp(state, payload) {
+      state.currentChatTimestamp = payload;
+    },
+    setChatUpdated(state, payload) {
+      state.chatUpdated = payload;
+    },
+    setRegexPatterns(state, payload) {
+      state.organizationData.regexPatterns = payload;
+    },
+    /**
+     * Set temporary theme color for live preview
+     * Called when user drags color picker in General Settings
+     * @param payload - { mode: 'light' | 'dark', color: '#hexcolor' }
+     * Example: { mode: 'light', color: '#FF0000' }
+     */
+    setTempThemeColor(state, payload: { mode: "light" | "dark"; color: string | null }) {
+      state.tempThemeColors[payload.mode] = payload.color;
+    },
+    /**
+     * Clear temporary theme colors
+     * Called when user clicks "Save" in General Settings (colors now permanently saved)
+     * or when user cancels/discards the preview
+     */
+    clearTempThemeColors(state) {
+      state.tempThemeColors.light = null;
+      state.tempThemeColors.dark = null;
+    },
+    /**
+     * Set pending short URL for polling-based clipboard copy
+     * Called after short URL API completes successfully
+     * @param payload - The short URL string to be copied
+     */
+    setPendingShortURL(state, payload) {
+      state.pendingShortURL = payload;
+    },
+    /**
+     * Clear pending short URL after successful copy
+     */
+    clearPendingShortURL(state) {
+      state.pendingShortURL = null;
+    },
+    setAlertListFilters(state, payload) {
+      state.alertListFilters = { ...state.alertListFilters, ...payload };
+    },
+    /**
+     * Cache the alert library manifest, stamping the time the TTL is measured
+     * from. Leaving lastFetched unset would make a warm cache look permanently
+     * stale and refetch on every render.
+     */
+    setAlertLibraryManifest(state, payload) {
+      state.alertLibrary.manifest = payload;
+      state.alertLibrary.lastFetched = Date.now();
+    },
+    /**
+     * Cache one alert file. Accumulates — opening a second drawer must not
+     * evict the first alert, since the gallery reopens drawers constantly
+     * while comparing alerts.
+     * @param payload - { id: '<pack>/<name>', file: alertJson }
+     */
+    setAlertLibraryFile(state, payload) {
+      state.alertLibrary.fileCache[payload.id] = payload.file;
+    },
+    /**
+     * Drop cached library data. Mutates IN PLACE and deliberately leaves
+     * `cacheExpiry` alone: that is configuration, not cached data, and
+     * reassigning the whole object would silently reset it.
+     *
+     * Not needed for org switching — the library is a global public catalog,
+     * identical for every org, and the org-specific half of a "Ready" verdict
+     * (the stream list) lives in useStreams and is recomputed at render.
+     */
+    clearAlertLibrary(state) {
+      state.alertLibrary.manifest = null;
+      state.alertLibrary.lastFetched = null;
+      state.alertLibrary.fileCache = {};
+    },
+    /**
+     * Set GitHub dashboard gallery cache
+     */
+    setGithubDashboardGallery(state, payload) {
+      state.githubDashboardGallery.dashboards = payload;
+      state.githubDashboardGallery.lastFetched = Date.now();
+    },
+    /**
+     * Clear GitHub dashboard gallery cache
+     */
+    clearGithubDashboardGallery(state) {
+      state.githubDashboardGallery.dashboards = [];
+      state.githubDashboardGallery.lastFetched = null;
+      state.githubDashboardGallery.dashboardJsonCache = {};
+    },
+    /**
+     * Cache individual dashboard JSON content
+     * @param payload - { key: 'folderPath/fileName', json: dashboardJson }
+     */
+    setDashboardJsonCache(state, payload) {
+      state.githubDashboardGallery.dashboardJsonCache[payload.key] = payload.json;
+    },
+  },
+  actions: {
+    login(context, payload) {
+      context.commit("login", payload);
+    },
+    logout(context) {
+      context.commit("logout");
+    },
+    endpoint(context, payload) {
+      context.commit("endpoint", payload);
+    },
+    setUserInfo(context, payload) {
+      context.commit("setUserInfo", payload);
+    },
+    // setIndexData(context, payload) {
+    //   context.commit("setIndexData", payload);
+    // },
+    setSelectedOrganization(context, payload) {
+      context.commit("setSelectedOrganization", payload);
+    },
+    setOrganizations(context, payload) {
+      context.commit("setOrganizations", payload);
+    },
+    setCurrentUser(context, payload) {
+      context.commit("setCurrentUser", payload);
+    },
+    setSearchCollapseToggle(context, payload) {
+      context.commit("setSearchCollapseToggle", payload);
+    },
+    setOrganizationPasscode(context, payload) {
+      context.commit("setOrganizationPasscode", payload);
+    },
+    setOrganizationPasscodeUser(context, payload) {
+      context.commit("setOrganizationPasscodeUser", payload);
+    },
+    resetOrganizationData(context, payload) {
+      context.commit("resetOrganizationData", payload);
+    },
+    setRUMToken(context, payload) {
+      context.commit("setRUMToken", payload);
+    },
+    setOrgTokens(context, payload) {
+      context.commit("setOrgTokens", payload);
+    },
+    // setAllCurrentDashboards(context, payload) {
+    //   context.commit('setAllCurrentDashboards', payload);
+    // },
+    // setCurrentSelectedDashboard(context, payload) {
+    //   context.commit('setCurrentSelectedDashboard', payload);
+    // },
+    setAllDashboardList(context, payload) {
+      context.commit("setAllDashboardList", payload);
+    },
+    setAllAlertsListByFolderId(context, payload) {
+      context.commit("setAllAlertsListByFolderId", payload);
+    },
+    setAllReportsListByFolderId(context, payload) {
+      context.commit("setAllReportsListByFolderId", payload);
+    },
+    setAllAlertsListByNames(context, payload) {
+      context.commit("setAllAlertsListByNames", payload);
+    },
+    setDashboardData(context, payload) {
+      context.commit("setDashboardData", payload);
+    },
+    setAllDashboardListHash(context, payload) {
+      context.commit("setAllDashboardListHash", payload);
+    },
+    setOrganizationSettings(context, payload) {
+      context.commit("setOrganizationSettings", payload);
+    },
+    setFolders(context, payload) {
+      context.commit("setFolders", payload);
+    },
+    setFoldersByType(context, payload) {
+      context.commit("setFoldersByType", payload);
+    },
+    setFunctions(context, payload) {
+      context.commit("setFunctions", payload);
+    },
+    setStreams(context, payload) {
+      context.commit("setStreams", payload);
+    },
+    resetStreams(context, payload) {
+      context.commit("resetStreams", payload);
+    },
+    // setSearch(context, payload) {
+    //   context.commit("setSearch", payload);
+    // },
+    // setStreamFields(context, payload) {
+    //   context.commit("setStreamFields", payload);
+    // },
+    // setCurrentPanelsData(context, payload) {
+    //   context.commit('setCurrentPanelsData', payload);
+    // },
+    setConfig(context, payload) {
+      context.commit("setConfig", payload);
+    },
+    appTheme(context, payload) {
+      context.commit("appTheme", payload);
+    },
+    setPrintMode(context, payload) {
+      context.commit("setPrintMode", payload);
+    },
+    setTimezone(context, payload) {
+      context.commit("setTimezone", payload);
+    },
+    setSavedViewDialog(context, payload) {
+      context.commit("setSavedViewDialog", payload);
+    },
+    setRefreshIntervalID(context, payload) {
+      context.commit("setRefreshIntervalID", payload);
+    },
+    setSavedViewFlag(context, payload) {
+      context.commit("setSavedViewFlag", payload);
+    },
+    setSavedFunctionDialog(context, payload) {
+      context.commit("setSavedFunctionDialog", payload);
+    },
+    setIsDataIngested(context, payload) {
+      context.commit("setIsDataIngested", payload);
+    },
+    setRegionInfo(context, payload) {
+      context.commit("setRegionInfo", payload);
+    },
+    setHiddenMenus(context, payload) {
+      context.commit("setHiddenMenus", payload);
+    },
+    setApiLimitsByOrgId(context, payload) {
+      context.commit("setApiLimitsByOrgId", payload);
+    },
+    setRoleLimitsByOrgIdByRole(context, payload) {
+      context.commit("setRoleLimitsByOrgIdByRole", payload);
+    },
+    setModulesToDisplay(context, payload) {
+      context.commit("setModulesToDisplay", payload);
+    },
+    setIsAiChatEnabled(context, payload) {
+      context.commit("setIsAiChatEnabled", payload);
+    },
+    setIsAiChatExpanded(context, payload) {
+      context.commit("setIsAiChatExpanded", payload);
+    },
+    setIsWebinarBannerVisible(context, payload) {
+      context.commit("setIsWebinarBannerVisible", payload);
+    },
+    setCurrentChatTimestamp(context, payload) {
+      context.commit("setCurrentChatTimestamp", payload);
+    },
+    setChatUpdated(context, payload) {
+      context.commit("setChatUpdated", payload);
+    },
+    setRegexPatterns(context, payload) {
+      context.commit("setRegexPatterns", payload);
+    },
+  },
+  modules: {
+    streams,
+    logs,
+    incidents,
+  },
+});

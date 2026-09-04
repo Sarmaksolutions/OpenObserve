@@ -1,0 +1,84 @@
+<!-- Copyright 2026 OpenObserve Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+-->
+
+<template>
+  <IngestionContent>
+    <CopyContent class="copy-content-container-cls" :content="raw(content)" />
+    <IngestionDocLink
+      href="https://axoflow.com/docs/axosyslog-core/chapter-destinations/openobserve/"
+    />
+  </IngestionContent>
+</template>
+
+<script lang="ts">
+import { raw } from "@/types/i18n";
+import { defineComponent, ref } from "vue";
+import config from "../../../aws-exports";
+import { useStore } from "vuex";
+import { getEndPoint, getImageURL, getIngestionURL } from "../../../utils/zincutils";
+import CopyContent from "@/components/CopyContent.vue";
+import IngestionContent from "@/components/ingestion/IngestionContent.vue";
+import IngestionDocLink from "@/components/ingestion/IngestionDocLink.vue";
+export default defineComponent({
+  name: "SyslogNg",
+  props: {
+    currOrgIdentifier: {
+      type: String,
+    },
+    currUserEmail: {
+      type: String,
+    },
+  },
+  components: { CopyContent, IngestionContent, IngestionDocLink },
+  setup() {
+    const store = useStore();
+    const endpoint: any = ref({
+      url: "",
+      host: "",
+      port: "",
+      protocol: "",
+      tls: "",
+    });
+
+    const ingestionURL = getIngestionURL();
+    endpoint.value = getEndPoint(ingestionURL);
+    const content = `destination d_openobserve_http {
+    openobserve-log(
+        url("${endpoint.value.url}")
+        organization("${store.state.selectedOrganization.identifier}")
+        stream("syslog-ng")
+        user("[EMAIL]")
+        password("[PASSCODE]")
+    );
+};
+
+
+log {
+    source(s_src);
+    destination(d_openobserve_http);
+    flags(flow-control);
+};`;
+    return {
+      raw,
+      store,
+      config,
+      endpoint,
+      content,
+      getImageURL,
+    };
+  },
+});
+</script>
