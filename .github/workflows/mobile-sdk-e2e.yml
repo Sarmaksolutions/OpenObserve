@@ -116,7 +116,7 @@ jobs:
       suite_ok: ${{ steps.validate.outputs.suite_ok }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: "20" }
 
       - name: Install suite dependencies
@@ -351,7 +351,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Protoc
         run: bash ./.github/protoc.sh
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: "20" }
       - name: Build binary + web UI (embedded)
         env:
@@ -399,7 +399,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Protoc (macOS)
         run: brew install protobuf || true
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: "20" }
       - name: Build binary + web UI (embedded)
         env:
@@ -480,7 +480,7 @@ jobs:
 
       - uses: actions/setup-java@v6
         with: { distribution: temurin, java-version: "17" }
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: "20" }
       - uses: gradle/actions/setup-gradle@v6
 
@@ -665,7 +665,7 @@ jobs:
           # Pin 16.4 explicitly: macos-15's 'latest-stable' is now Xcode 26, which dropped the Swift
           # compatibility libs the SDK's static libs force-load → arm64 link error. 16.x still ships them.
           xcode-version: "16.4"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: "20" }
 
       - name: Install Maestro + xcodegen + watchman
@@ -826,7 +826,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: "20" }
       - name: Install suite deps
         working-directory: tests/mobile-testing
